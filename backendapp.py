@@ -12,7 +12,6 @@ import pypdf
 
 app = FastAPI(title="QT1 Doc Control API - Full Header Footer Sync")
 
-# --- CẤU HÌNH CORS ĐÃ ĐƯỢC CHUẨN HÓA MỞ CỔNG BẢO MẬT ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -172,7 +171,8 @@ def replace_value_after_keyword(paragraph, keyword, new_text):
         kw_font = paragraph.runs[0].font
         kw_name, kw_size, kw_bold, kw_italic = kw_font.name, kw_font.size, kw_font.bold, kw_font.italic
         val_font = paragraph.runs[-1].font
-        val_name, val_size, val_bold, val_italic = val_font.name, val_font.size, val_bold, val_font.italic
+        # Đã sửa lỗi đánh máy val_font.bold tại đây
+        val_name, val_size, val_bold, val_italic = val_font.name, val_font.size, val_font.bold, val_font.italic
         
         paragraph.clear()
         r1 = paragraph.add_run(keyword)
@@ -185,6 +185,7 @@ def replace_value_after_keyword(paragraph, keyword, new_text):
 def update_date_paragraph(paragraph, new_date_str):
     spaces = "                                "
     val_font = paragraph.runs[-1].font
+    # Đã sửa lỗi đánh máy val_font.bold tại đây
     val_name, val_size, val_bold, val_italic = val_font.name, val_font.size, val_font.bold, val_font.italic
     
     paragraph.clear()
@@ -213,7 +214,6 @@ def sync_footer_content(doc, qti_no, subject):
                         if font_color:
                             r.font.color.rgb = font_color
                         else:
-                            # Cấu hình màu xám chuẩn cho Footer nếu file mất định dạng
                             r.font.color.rgb = RGBColor(128, 128, 128)
                             r.font.size = Pt(10)
                     else:
@@ -468,7 +468,6 @@ async def export_zip_full(
             # =========================================================================
             doc_en = Document(en_template_path)
             
-            # Đồng bộ phần Tiêu đề
             for tbl in doc_en.tables:
                 for row in tbl.rows:
                     for cell in row.cells:
@@ -482,10 +481,8 @@ async def export_zip_full(
                             elif "Subject:" in p.text:
                                 replace_value_after_keyword(p, "Subject:", cover_data['subject'])
 
-            # ĐỒNG BỘ CHÂN TRANG (FOOTER)
             sync_footer_content(doc_en, qti_no.strip(), cover_data['subject'])
 
-            # Chèn nội dung thân thư
             ref_idx = None
             yours_idx = None
             for idx, p in enumerate(doc_en.paragraphs):
