@@ -12,6 +12,7 @@ import pypdf
 
 app = FastAPI(title="QT1 Doc Control API - Full Header Footer Sync")
 
+# --- CẤU HÌNH CORS ĐÃ ĐƯỢC CHUẨN HÓA MỞ CỔNG BẢO MẬT ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -171,7 +172,7 @@ def replace_value_after_keyword(paragraph, keyword, new_text):
         kw_font = paragraph.runs[0].font
         kw_name, kw_size, kw_bold, kw_italic = kw_font.name, kw_font.size, kw_font.bold, kw_font.italic
         val_font = paragraph.runs[-1].font
-        val_name, val_size, val_bold, val_italic = val_font.name, val_font.size, val_font.bold, val_font.italic
+        val_name, val_size, val_bold, val_italic = val_font.name, val_font.size, val_bold, val_font.italic
         
         paragraph.clear()
         r1 = paragraph.add_run(keyword)
