@@ -29,9 +29,65 @@ def clean_safe_filename(name: str) -> str:
     cleaned = re.sub(r'[\\/*?:"<>|]', '-', name).strip()
     return cleaned[:130] if len(cleaned) > 130 else cleaned
 
+def parse_date_to_dmy(text: str) -> str:
+    """Hàm bóc tách và chuẩn hóa ngày tháng tiếng Anh/tiếng Việt sang dạng DD/MM/YYYY"""
+    months = {
+        'jan': 1, 'january': 1,
+        'feb': 2, 'february': 2,
+        'mar': 3, 'march': 3,
+        'apr': 4, 'april': 4,
+        'may': 5,
+        'jun': 6, 'june': 6,
+        'jul': 7, 'july': 7,
+        'aug': 8, 'august': 8,
+        'sep': 9, 'september': 9, 'sept': 9,
+        'oct': 10, 'october': 10,
+        'nov': 11, 'november': 11,
+        'dec': 12, 'december': 12
+    }
+    
+    # 1. Dạng: October 19, 2026 hoặc Oct 19 2026
+    m1 = re.search(r'([A-Za-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(202\d)', text)
+    if m1:
+        mon_str = m1.group(1).lower()
+        if mon_str in months:
+            day = int(m1.group(2))
+            mon = months[mon_str]
+            yr = m1.group(3)
+            return f"{day:02d}/{mon:02d}/{yr}"
+
+    # 2. Dạng: 19 October 2026 hoặc 19 Oct 2026
+    m2 = re.search(r'(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]+),?\s+(202\d)', text)
+    if m2:
+        mon_str = m2.group(2).lower()
+        if mon_str in months:
+            day = int(m2.group(1))
+            mon = months[mon_str]
+            yr = m2.group(3)
+            return f"{day:02d}/{mon:02d}/{yr}"
+
+    # 3. Dạng số: DD/MM/YYYY hoặc DD-MM-YYYY hoặc DD.MM.YYYY
+    m3 = re.search(r'(\d{1,2})[\/.-](\d{1,2})[\/.-](202\d)', text)
+    if m3:
+        day = int(m3.group(1))
+        mon = int(m3.group(2))
+        yr = m3.group(3)
+        if 1 <= mon <= 12 and 1 <= day <= 31:
+            return f"{day:02d}/{mon:02d}/{yr}"
+
+    # 4. Dạng chuẩn: YYYY-MM-DD
+    m4 = re.search(r'(202\d)[\/.-](\d{1,2})[\/.-](\d{1,2})', text)
+    if m4:
+        yr = m4.group(1)
+        mon = int(m4.group(2))
+        day = int(m4.group(3))
+        if 1 <= mon <= 12 and 1 <= day <= 31:
+            return f"{day:02d}/{mon:02d}/{yr}"
+
+    return ""
+
 def extract_info_from_filename(filename: str):
     clean_name = os.path.splitext(filename or "")[0].strip()
-    # Tìm mã tài liệu QT1 dạng QT1-HDS-PMB2-L-2349 hoặc QT1-HDH-PMB2-T-6015
     m = re.search(r'(QT1-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+)', clean_name)
     if not m:
         m = re.search(r'(QT1-[A-Za-z0-9_-]+)', clean_name)
@@ -97,7 +153,7 @@ def parse_cover_pdf_bytes(pdf_bytes, filename=""):
         print(f"Lỗi đọc PDF pypdf: {e}")
 
     if p1_txt:
-        # Tìm số công văn / số đệ trình
+        # 1. Tìm số công văn / số đệ trình
         ref_patterns = [
             r'(?:Ref\.?\s*(?:No\.?)?|Letter\s*(?:No\.?)?|TR\.?\s*(?:No\.?)?|Transmittal\s*(?:No\.?)?|No\.?)\s*[:\s]*([A-Za-z0-9_-]*QT1[A-Za-z0-9_-]+)',
             r'(QT1-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+-\d+)',
@@ -111,19 +167,22 @@ def parse_cover_pdf_bytes(pdf_bytes, filename=""):
                     metadata['tr_no'] = found_ref
                     break
         
-        # Tìm ngày tháng
+        # 2. Tìm ngày tháng (Đặc biệt xử lý các định dạng như Date: October 19, 2026)
         date_m = re.search(r'Date\s*[:\s]+([^\n\r]+)', p1_txt, re.IGNORECASE)
+        date_found = False
         if date_m:
-            d_raw = date_m.group(1).strip()
-            m_num = re.search(r'(\d{1,2})[\s/.-]+(\d{1,2})[\s/.-]+(202\d)', d_raw)
-            if m_num:
-                metadata['date_str'] = f"{int(m_num.group(1)):02d}/{int(m_num.group(2)):02d}/{m_num.group(3)}"
-            else:
-                clean_date = re.sub(r'[^\d]', '', d_raw)
-                if len(clean_date) >= 8 and clean_date[4:8].startswith("202"):
-                    metadata['date_str'] = f"{clean_date[:2]}/{clean_date[2:4]}/{clean_date[4:8]}"
+            parsed_d = parse_date_to_dmy(date_m.group(1))
+            if parsed_d:
+                metadata['date_str'] = parsed_d
+                date_found = True
+        
+        # Nếu chưa tìm thấy cạnh chữ Date, quét 500 ký tự đầu tiên
+        if not date_found:
+            fallback_d = parse_date_to_dmy(p1_txt[:500])
+            if fallback_d:
+                metadata['date_str'] = fallback_d
 
-        # Tìm chủ đề (Subject)
+        # 3. Tìm chủ đề (Subject)
         subj_m = re.search(r'(?:SUBJECT|Subject|Sub|V/v)\s*[:\s]+([^\n\r]+)', p1_txt)
         if subj_m:
             raw_subj = subj_m.group(1).strip()
@@ -131,7 +190,7 @@ def parse_cover_pdf_bytes(pdf_bytes, filename=""):
             if len(raw_subj) >= 5:
                 metadata['subject'] = raw_subj
 
-    # Ưu tiên lấy từ tên file nếu đọc trong PDF bị rỗng
+    # Ưu tiên dữ liệu chuẩn từ tên file nếu đọc trong PDF bị thiếu
     if (not metadata['tr_no'] or metadata['tr_no'] == 'QT1-Letter') and fn_doc_no:
         metadata['tr_no'] = fn_doc_no
     if (not metadata['subject'] or metadata['subject'] == 'Official Transmittal') and fn_subject:
@@ -254,7 +313,6 @@ async def export_zip_full(
         current_date_str = now.strftime("%d %b %Y")
         current_date_en = now.strftime("%B %d, %Y")
         
-        # Bóc tách thông tin từ file Cover
         cover_data = {
             'tr_no': 'QT1-Document',
             'date_str': now.strftime("%d/%m/%Y"),
