@@ -16,7 +16,7 @@ from fastapi import FastAPI, File, Form, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 import openpyxl
-from openpyxl.styles import Font
+from openpyxl.styles import Font, PatternFill
 import pypdf
 from starlette.background import BackgroundTask
 
@@ -78,7 +78,7 @@ def extract_cover_date_bulletproof(text: str) -> str:
         r"Sheet\s*:\s*\d+\s*of\s*\d+", "", snippet_clean, flags=re.IGNORECASE
     )
 
-    # 1. Dạng 8 chữ số cách nhau trong Transmittal: "1 0 1 0 2 0 2 6" hoặc "10 10 2026"
+    # Dạng 8 chữ số cách nhau trong Transmittal: "1 0 1 0 2 0 2 6" hoặc "10 10 2026"
     m_8digits = re.search(
         r"[:\s-]*\s*(\d)\s*(\d)\s*(\d)\s*(\d)\s*(2)\s*(0)\s*(2)\s*(\d)",
         snippet_clean,
@@ -91,7 +91,7 @@ def extract_cover_date_bulletproof(text: str) -> str:
       if 1 <= m_val <= 12 and 1 <= d_val <= 31:
         return f"{d_val:02d}/{m_val:02d}/{y_val}"
 
-    # 2. Dạng DD/MM/YYYY
+    # Dạng DD/MM/YYYY
     m_slash = re.search(
         r"[:\s-]*\s*(\d{1,2})[\/.-](\d{1,2})[\/.-](202\d)", snippet_clean
     )
@@ -102,7 +102,7 @@ def extract_cover_date_bulletproof(text: str) -> str:
       if 1 <= m_val <= 12 and 1 <= d_val <= 31:
         return f"{d_val:02d}/{m_val:02d}/{y_val}"
 
-    # 3. Dạng chữ tiếng Anh: "October 19, 2026"
+    # Dạng chữ tiếng Anh: "October 19, 2026"
     collapsed = re.sub(r"\s+", " ", snippet_clean).strip()
     m_en = re.search(
         r"\b(" + month_pat + r")\s*(\d{1,2})\s*,?\s*(202\s*\d)",
@@ -164,12 +164,6 @@ def extract_cover_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
     )[0].strip()
     subject = raw_sub
 
-  if not subject and tr_no and filename:
-    parts = os.path.splitext(filename)[0].split(tr_no, 1)
-    if len(parts) > 1 and parts[1].strip("_- "):
-      subject = parts[1].strip("_- ")
-      subject = re.sub(r"(_|-)?Cover$", "", subject, flags=re.IGNORECASE).strip()
-
   if not subject:
     subject = "Official Transmittal"
 
@@ -219,6 +213,10 @@ def extract_cover_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
         words.pop(0)
 
       title = " ".join(words).strip()
+      # Tách từ dính liền nếu có
+      title = re.sub(
+          r"VoltageTransformer", "Voltage Transformer", title, flags=re.IGNORECASE
+      )
       if not title:
         title = subject
 
@@ -421,14 +419,26 @@ async def export_zip_full(
             content = await file.read()
 
             # =========================================================================
-            # CHẾ ĐỘ: NUMBER FILLED CARS (KỸ SƯ ĐÃ ĐIỀN ĐẦY ĐỦ - CHỈ CẤP SỐ CAR VÀO E1)
+            # CHẾ ĐỘ: NUMBER FILLED CARS (KỸ SƯ ĐÃ ĐIỀN ĐỦ DỮ LIỆU - CHỈ CẤP SỐ CAR VÀO E1)
             # =========================================================================
             if mode == "number_filled_cars":
               cur_num = start_num + file_idx
-              car_num_str = f"{cur_num:04d}" if cur_num < 10000 else f"{cur_num}"
+              car_num_str = (
+                  f"{cur_num:04d}" if cur_num < 10000 else f"{cur_num}"
+              )
               car_base = f"{car_num_str} CaRs"
 
               wb = openpyxl.load_workbook(io.BytesIO(content))
+
+              # Khắc phục triệt để lỗi "Removed Records: Worksheet properties" khi mở Excel
+              for ws_item in wb.worksheets:
+                if (
+                    hasattr(ws_item, "sheet_properties")
+                    and ws_item.sheet_properties
+                ):
+                  if hasattr(ws_item.sheet_properties, "pageSetUpPr"):
+                    ws_item.sheet_properties.pageSetUpPr.fitToPage = None
+
               max_r = 1
               target_ws = wb.active
               for s_name in wb.sheetnames:
@@ -452,7 +462,7 @@ async def export_zip_full(
               if not com_col:
                 com_col = 7
 
-              # 1. ĐỌC TỰ ĐỘNG STATUS TỪ FILE CARS CỦA KỸ SƯ
+              # 1. ĐỌC CHÍNH XÁC STATUS TỪ FILE CARS CỦA KỸ SƯ
               detected_status_raw = "APPROVED (APP)"
               found_rfc, found_awc, found_rj = False, False, False
               for r in range(11, 16):
@@ -535,25 +545,34 @@ async def export_zip_full(
                 clean_t = os.path.splitext(clean_t)[0].strip()
                 final_title = clean_t if clean_t else cover_data["subject"]
 
-              # 3. CẤP SỐ CAR CHUẨN VÀO Ô E1 (THAY THẾ 00xx / Xxxx / 00xx-R1 / Xxxx-R1)
+              final_title = re.sub(
+                  r"VoltageTransformer",
+                  "Voltage Transformer",
+                  final_title,
+                  flags=re.IGNORECASE,
+              )
+
+              # 3. CẤP SỐ CAR CHUẨN VÀO Ô E1 VÀ XÓA BỎ BÔI VÀNG
               red_title_font = Font(
                   name="Times New Roman", size=16, bold=True, color="FFFF0000"
               )
+              no_fill = PatternFill(fill_type=None)
               e1_text = f"{car_num_str}-R{max_r}"
 
-              # Tìm ô chứa mã tạm ở dòng 1
               found_cell_r1 = False
               for c in range(2, 10):
                 val_r1 = str(target_ws.cell(row=1, column=c).value or "").strip()
                 if re.search(r"(00xx|xxxx|Xxxx)", val_r1, re.IGNORECASE):
                   target_ws.cell(row=1, column=c).value = e1_text
                   target_ws.cell(row=1, column=c).font = red_title_font
+                  target_ws.cell(row=1, column=c).fill = no_fill
                   found_cell_r1 = True
                   break
 
               if not found_cell_r1:
                 target_ws.cell(row=1, column=5).value = e1_text
                 target_ws.cell(row=1, column=5).font = red_title_font
+                target_ws.cell(row=1, column=5).fill = no_fill
 
               # ĐỒNG BỘ MÃ DOC & TITLE VÀO DÒNG 4, 5 (BẢO LƯU NGUYÊN VẸN SENDER G2 VÀ Ý KIẾN KỸ SƯ)
               target_ws.cell(row=4, column=com_col).value = (
@@ -583,6 +602,15 @@ async def export_zip_full(
             # =========================================================================
             elif mode == "auto_bump":
               wb = openpyxl.load_workbook(io.BytesIO(content))
+
+              for ws_item in wb.worksheets:
+                if (
+                    hasattr(ws_item, "sheet_properties")
+                    and ws_item.sheet_properties
+                ):
+                  if hasattr(ws_item.sheet_properties, "pageSetUpPr"):
+                    ws_item.sheet_properties.pageSetUpPr.fitToPage = None
+
               max_r = 1
               target_sheet_name = wb.sheetnames[0]
               target_idx = 0
