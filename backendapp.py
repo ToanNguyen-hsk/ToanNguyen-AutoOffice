@@ -12,7 +12,7 @@ import re, io, zipfile, traceback, os, base64, gc, tempfile, json
 from datetime import datetime
 import pypdf
 
-app = FastAPI(title="QT1 Doc Control API - 5 Processing Modes")
+app = FastAPI(title="QT1 Doc Control API - Dual Extraction Engine")
 
 app.add_middleware(
     CORSMiddleware,
@@ -26,14 +26,37 @@ app.add_middleware(
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def clean_safe_filename(name: str) -> str:
-    return re.sub(r'[\\/*?:"<>|]', '-', name).strip()
+    cleaned = re.sub(r'[\\/*?:"<>|]', '-', name).strip()
+    return cleaned[:130] if len(cleaned) > 130 else cleaned
+
+def extract_info_from_filename(filename: str):
+    clean_name = os.path.splitext(filename or "")[0].strip()
+    # Tìm mã tài liệu QT1 dạng QT1-HDS-PMB2-L-2349 hoặc QT1-HDH-PMB2-T-6015
+    m = re.search(r'(QT1-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+)', clean_name)
+    if not m:
+        m = re.search(r'(QT1-[A-Za-z0-9_-]+)', clean_name)
+    
+    doc_no = m.group(1).strip() if m else ""
+    subject = ""
+    if doc_no:
+        parts = clean_name.split(doc_no, 1)
+        if len(parts) > 1 and parts[1].strip('_- '):
+            subject = parts[1].strip('_- ')
+            subject = re.sub(r'(_|-)?Cover$', '', subject, flags=re.IGNORECASE).strip()
+    return doc_no, subject
 
 def extract_clean_doc_no(text: str) -> str:
-    m = re.search(r'(QT1-[0-9L]-[A-Z]+-[A-Z0-9]+-\d{2}-\d{5})', text)
+    m = re.search(r'(QT1-[0-9A-Z]+-[A-Z0-9]+-[A-Z0-9]+-\d{2}-\d{5})', text)
     if m: return m.group(1)
-    m2 = re.search(r'(QT1-[0-9L]-[A-Z0-9-]+)', text)
+    m2 = re.search(r'(QT1-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+)', text)
     if m2:
         base = m2.group(1)
+        base = re.sub(r'_[A-Za-z0-9]+$', '', base)
+        base = re.sub(r'_?Rev\.?.*$', '', base, flags=re.IGNORECASE)
+        return base
+    m3 = re.search(r'(QT1-[A-Za-z0-9_-]+)', text)
+    if m3:
+        base = m3.group(1)
         base = re.sub(r'_[A-Za-z0-9]+$', '', base)
         base = re.sub(r'_?Rev\.?.*$', '', base, flags=re.IGNORECASE)
         return base
@@ -55,89 +78,75 @@ def get_latest_status_from_ws(ws, max_r):
         elif "RJ" in status_val: return "RJ"
     return "APP"
 
-def parse_cover_pdf_bytes(pdf_bytes):
-    reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+def parse_cover_pdf_bytes(pdf_bytes, filename=""):
+    fn_doc_no, fn_subject = extract_info_from_filename(filename)
+    
     metadata = {
-        'tr_no': 'QT1-HDH-PMB2-T-6015',
+        'tr_no': fn_doc_no if fn_doc_no else 'QT1-Letter',
         'date_str': datetime.now().strftime("%d/%m/%Y"), 
-        'subject': 'Entire set of Mechnical P&IDs',
+        'subject': fn_subject if fn_subject else 'Official Transmittal',
         'docs': {}
     }
-    p1_txt = reader.pages[0].extract_text() or ""
     
-    tr_m = re.search(r'TR\.\s*No\.?\s*[:\s]*([A-Z0-9_-]+)', p1_txt)
-    if tr_m: metadata['tr_no'] = tr_m.group(1).strip()
-    
-    date_m = re.search(r'Date\s*[:\s]+([\d\s/]+)', p1_txt, re.IGNORECASE)
-    if date_m:
-        clean_date = re.sub(r'[^\d]', '', date_m.group(1))
-        if len(clean_date) >= 8:
-            clean_date = clean_date[:8]
-            if clean_date[4:8].startswith("202"):
-                metadata['date_str'] = f"{clean_date[:2]}/{clean_date[2:4]}/{clean_date[4:8]}"
-            
-    subj_m = re.search(r'SUBJECT\s*[:\s]*([^\n]+)', p1_txt)
-    if subj_m: metadata['subject'] = subj_m.group(1).split('Document/Drawing')[0].strip()
+    p1_txt = ""
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+        if reader.pages:
+            p1_txt = reader.pages[0].extract_text() or ""
+    except Exception as e:
+        print(f"Lỗi đọc PDF pypdf: {e}")
 
-    for page in reader.pages:
-        parts = []
-        def visitor(text, cm, tm, fontDict, fontSize):
-            if text.strip(): parts.append((tm[4], tm[5], text.strip()))
-        page.extract_text(visitor_text=visitor)
+    if p1_txt:
+        # Tìm số công văn / số đệ trình
+        ref_patterns = [
+            r'(?:Ref\.?\s*(?:No\.?)?|Letter\s*(?:No\.?)?|TR\.?\s*(?:No\.?)?|Transmittal\s*(?:No\.?)?|No\.?)\s*[:\s]*([A-Za-z0-9_-]*QT1[A-Za-z0-9_-]+)',
+            r'(QT1-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+-\d+)',
+            r'(QT1-[A-Za-z0-9_-]+)'
+        ]
+        for pat in ref_patterns:
+            tr_m = re.search(pat, p1_txt, re.IGNORECASE)
+            if tr_m:
+                found_ref = tr_m.group(1).strip()
+                if len(found_ref) >= 8:
+                    metadata['tr_no'] = found_ref
+                    break
         
-        rows = {}
-        for px, py, ptxt in parts:
-            matched_y = None
-            for y in rows.keys():
-                if abs(y - py) <= 3:
-                    matched_y = y
-                    break
-            if matched_y is None:
-                matched_y = py
-                rows[matched_y] = []
-            rows[matched_y].append((px, ptxt))
-            
-        for y, items in rows.items():
-            items.sort(key=lambda x: x[0])
-            doc_no = None
-            for i, (x, txt) in enumerate(items):
-                m = re.search(r'(QT1-[0-9L]-[A-Z]+-[A-Z0-9]+-\d{2}-\d{5})', txt)
-                if m:
-                    doc_no = m.group(1)
-                    rev = "1"
-                    title_parts = []
-                    if i + 1 < len(items):
-                        rev_candidate = items[i+1][1].strip()
-                        if len(rev_candidate) <= 3 and rev_candidate.isalnum():
-                            rev = rev_candidate
-                            title_start_idx = i + 2
-                        else:
-                            title_start_idx = i + 1
-                            
-                        for j in range(title_start_idx, len(items)):
-                            t = items[j][1]
-                            if t not in ['APD', 'IFA', 'IFI', 'RI', '- END -']:
-                                title_parts.append(t)
-                    
-                    title = " ".join(title_parts).strip()
-                    title = re.sub(r'\s+(APD|IFA|IFI|RI|- END -).*$', '', title).strip()
-                    
-                    if doc_no:
-                        metadata['docs'][doc_no] = {
-                            'doc_no': doc_no,
-                            'rev': rev,
-                            'title': title
-                        }
-                    break
+        # Tìm ngày tháng
+        date_m = re.search(r'Date\s*[:\s]+([^\n\r]+)', p1_txt, re.IGNORECASE)
+        if date_m:
+            d_raw = date_m.group(1).strip()
+            m_num = re.search(r'(\d{1,2})[\s/.-]+(\d{1,2})[\s/.-]+(202\d)', d_raw)
+            if m_num:
+                metadata['date_str'] = f"{int(m_num.group(1)):02d}/{int(m_num.group(2)):02d}/{m_num.group(3)}"
+            else:
+                clean_date = re.sub(r'[^\d]', '', d_raw)
+                if len(clean_date) >= 8 and clean_date[4:8].startswith("202"):
+                    metadata['date_str'] = f"{clean_date[:2]}/{clean_date[2:4]}/{clean_date[4:8]}"
+
+        # Tìm chủ đề (Subject)
+        subj_m = re.search(r'(?:SUBJECT|Subject|Sub|V/v)\s*[:\s]+([^\n\r]+)', p1_txt)
+        if subj_m:
+            raw_subj = subj_m.group(1).strip()
+            raw_subj = re.split(r'(?:Document/Drawing|Attachment|Attn:|Dear)', raw_subj, flags=re.IGNORECASE)[0].strip()
+            if len(raw_subj) >= 5:
+                metadata['subject'] = raw_subj
+
+    # Ưu tiên lấy từ tên file nếu đọc trong PDF bị rỗng
+    if (not metadata['tr_no'] or metadata['tr_no'] == 'QT1-Letter') and fn_doc_no:
+        metadata['tr_no'] = fn_doc_no
+    if (not metadata['subject'] or metadata['subject'] == 'Official Transmittal') and fn_subject:
+        metadata['subject'] = fn_subject
+
     return metadata
 
-def parse_cover_excel_bytes(excel_bytes):
+def parse_cover_excel_bytes(excel_bytes, filename=""):
+    fn_doc_no, fn_subject = extract_info_from_filename(filename)
     wb = openpyxl.load_workbook(io.BytesIO(excel_bytes), data_only=True)
     ws = wb.active
     metadata = {
-        'tr_no': 'QT1-HDH-PMB2-T-6015',
+        'tr_no': fn_doc_no if fn_doc_no else 'QT1-Document',
         'date_str': datetime.now().strftime("%d/%m/%Y"),
-        'subject': 'Entire set of Mechnical P&IDs',
+        'subject': fn_subject if fn_subject else 'Official Transmittal',
         'docs': {}
     }
     for r in range(1, ws.max_row + 1):
@@ -245,19 +254,20 @@ async def export_zip_full(
         current_date_str = now.strftime("%d %b %Y")
         current_date_en = now.strftime("%B %d, %Y")
         
+        # Bóc tách thông tin từ file Cover
         cover_data = {
-            'tr_no': 'QT1-HDH-PMB2-T-6015',
+            'tr_no': 'QT1-Document',
             'date_str': now.strftime("%d/%m/%Y"),
-            'subject': 'Official Response Transmittal',
+            'subject': 'Official Transmittal',
             'docs': {}
         }
         
         if cover_file is not None:
             cover_bytes = await cover_file.read()
             if cover_file.filename.lower().endswith('.pdf'):
-                cover_data = parse_cover_pdf_bytes(cover_bytes)
+                cover_data = parse_cover_pdf_bytes(cover_bytes, cover_file.filename)
             elif cover_file.filename.lower().endswith(('.xlsx', '.xls')):
-                cover_data = parse_cover_excel_bytes(cover_bytes)
+                cover_data = parse_cover_excel_bytes(cover_bytes, cover_file.filename)
             del cover_bytes
 
         vi_template_path = find_template("TV")
@@ -715,6 +725,8 @@ async def export_zip_full(
             # XUẤT THƯ TIẾNG ANH
             # =========================================================================
             doc_en = Document(en_template_path)
+            doc_type_en = "Letter" if "-L-" in cover_data['tr_no'].upper() else "Transmittal"
+
             for tbl in doc_en.tables:
                 for row in tbl.rows:
                     for cell in row.cells:
@@ -733,9 +745,14 @@ async def export_zip_full(
             ref_idx = None
             yours_idx = None
             for idx, p in enumerate(doc_en.paragraphs):
-                if "This has reference to the Transmittal" in p.text:
+                if "This has reference to the" in p.text:
                     p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-                    replace_value_after_keyword(p, "This has reference to the Transmittal", f"{cover_data['tr_no']}, we would like to comment as follows:")
+                    font_name = p.runs[0].font.name if (p.runs and p.runs[0].font.name) else "Times New Roman"
+                    font_size = p.runs[0].font.size if (p.runs and p.runs[0].font.size) else Pt(13)
+                    p.clear()
+                    r = p.add_run(f"This has reference to the {doc_type_en} {cover_data['tr_no']}, we would like to comment as follows:")
+                    r.font.name = font_name
+                    r.font.size = font_size
                     ref_idx = idx
                 elif "Yours sincerely" in p.text:
                     p.alignment = WD_ALIGN_PARAGRAPH.LEFT
@@ -774,7 +791,8 @@ async def export_zip_full(
                         new_p.paragraph_format.first_line_indent = Inches(-0.35)
                         new_p.paragraph_format.space_before = 0
                         new_p.paragraph_format.space_after = Pt(4)
-                        run = new_p.add_run("-\tWe have reviewed the submitted documents/transmittal and have no objection.")
+                        doc_ref_word = "letter/proposal" if "-L-" in cover_data['tr_no'].upper() else "transmittal/documents"
+                        run = new_p.add_run(f"-\tWe have reviewed the submitted {doc_ref_word} and have no objection.")
                         run.font.name = 'Times New Roman'
                         run.font.size = Pt(13)
                 else:
@@ -797,9 +815,9 @@ async def export_zip_full(
             del en_io, doc_en
 
             summary_title = "TRẢ LỜI THƯ (KHÔNG CÓ CAR)" if mode == "no_car_letter" else "DANH SÁCH BỘ HỒ SƠ ĐÃ XUẤT"
-            summary_txt = f"{summary_title}:\n" + "="*50 + f"\nSố thư: {qti_no}\nChủ đề: {cover_data['subject']}\nCăn cứ TR: {cover_data['tr_no']} ({cover_data['date_str']})\n\n"
+            summary_txt = f"{summary_title}:\n" + "="*50 + f"\nSố thư xuất: {qti_no}\nChủ đề: {cover_data['subject']}\nCăn cứ thư EPC: {cover_data['tr_no']} ({cover_data['date_str']})\n\n"
             for item in processed_car_list:
-                summary_txt += f"• [{item['status']}] {item['doc_no']} Rev.{item['rev']}: {item['title']}\n  Đính kèm: {item['assigned_car_name']}\n\n"
+                summary_txt += f"• [{item['status']}] {item['doc_no']}: {item['title']}\n  Đính kèm: {item['assigned_car_name']}\n\n"
             zip_file.writestr("00_TONG_HOP_KET_QUA.txt", summary_txt.encode('utf-8'))
 
         safe_qti_name = clean_safe_filename(qti_no)
