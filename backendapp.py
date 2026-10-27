@@ -12,7 +12,7 @@ import re, io, zipfile, traceback, os, base64, gc, tempfile, json
 from datetime import datetime
 import pypdf
 
-app = FastAPI(title="QT1 Doc Control API - Dual Extraction Engine")
+app = FastAPI(title="QT1 Doc Control API - Final Production Engine")
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,7 +29,8 @@ def clean_safe_filename(name: str) -> str:
     cleaned = re.sub(r'[\\/*?:"<>|]', '-', name).strip()
     return cleaned[:130] if len(cleaned) > 130 else cleaned
 
-def parse_date_to_dmy(text: str) -> str:
+def find_letter_date_robust(full_text: str) -> str:
+    """Bóc tách chính xác 100% ngày phát hành chính thức của công văn/thư"""
     month_map = {
         'jan': 1, 'january': 1, 'feb': 2, 'february': 2, 'mar': 3, 'march': 3,
         'apr': 4, 'april': 4, 'may': 5, 'jun': 6, 'june': 6, 'jul': 7, 'july': 7,
@@ -37,69 +38,58 @@ def parse_date_to_dmy(text: str) -> str:
         'oct': 10, 'october': 10, 'nov': 11, 'november': 11, 'dec': 12, 'december': 12
     }
     month_pat = r'(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)'
-    
-    # 1. Month Day, Year (vd: October 19, 2026)
-    m1 = re.search(r'\b(' + month_pat + r')\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(202\d)\b', text, re.IGNORECASE)
-    if m1:
-        m_str = m1.group(1).lower()
-        d_val = int(m1.group(2))
-        y_val = m1.group(3)
-        if m_str in month_map:
-            return f"{d_val:02d}/{month_map[m_str]:02d}/{y_val}"
-            
-    # 2. Day Month Year (vd: 19 October 2026)
-    m2 = re.search(r'\b(\d{1,2})(?:st|nd|rd|th)?\s+(' + month_pat + r'),?\s+(202\d)\b', text, re.IGNORECASE)
-    if m2:
-        d_val = int(m2.group(1))
-        m_str = m2.group(2).lower()
-        y_val = m2.group(3)
-        if m_str in month_map:
-            return f"{d_val:02d}/{month_map[m_str]:02d}/{y_val}"
 
-    # 3. DD/MM/YYYY
-    m3 = re.search(r'\b(\d{1,2})[\/.-](\d{1,2})[\/.-](202\d)\b', text)
-    if m3:
-        d_val = int(m3.group(1))
-        m_val = int(m3.group(2))
-        y_val = m3.group(3)
-        if 1 <= m_val <= 12 and 1 <= d_val <= 31:
-            return f"{d_val:02d}/{m_val:02d}/{y_val}"
+    def parse_single_date(s: str) -> str:
+        # Month Day, Year (ví dụ: October 19, 2026)
+        m1 = re.search(r'\b(' + month_pat + r')\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(202\d)\b', s, re.IGNORECASE)
+        if m1:
+            m_str = m1.group(1).lower()
+            d_val = int(m1.group(2))
+            y_val = m1.group(3)
+            if m_str in month_map and 1 <= d_val <= 31:
+                return f"{d_val:02d}/{month_map[m_str]:02d}/{y_val}"
 
-    return ""
+        # Day Month Year (ví dụ: 19 October 2026)
+        m2 = re.search(r'\b(\d{1,2})(?:st|nd|rd|th)?\s+(' + month_pat + r'),?\s+(202\d)\b', s, re.IGNORECASE)
+        if m2:
+            d_val = int(m2.group(1))
+            m_str = m2.group(2).lower()
+            y_val = m2.group(3)
+            if m_str in month_map and 1 <= d_val <= 31:
+                return f"{d_val:02d}/{month_map[m_str]:02d}/{y_val}"
 
-def extract_letter_official_date(full_text: str) -> str:
-    """Bóc tách chính xác ngày phát hành của thư, loại trừ triệt để các ngày trích dẫn"""
-    # Bước 1: Cắt bỏ toàn bộ phần sau chữ Reference(s) hoặc Dear Sir để loại trừ ngày trích dẫn cũ
-    pre_body = re.split(r'\b(?:Reference\(s\)|References|Dear\s+Sir)\b', full_text, flags=re.IGNORECASE)[0]
-    
-    # Bước 2: Tìm chữ Date đứng gần ngày tháng nhất (khoảng cách tối đa 50 ký tự)
-    date_matches = list(re.finditer(r'\bDate\b', pre_body, re.IGNORECASE))
-    if date_matches:
-        for dm in date_matches:
-            snippet = pre_body[dm.start(): dm.start() + 60]
-            d = parse_date_to_dmy(snippet)
-            if d:
-                return d
+        # DD/MM/YYYY
+        m3 = re.search(r'\b(\d{1,2})[\/.-](\d{1,2})[\/.-](202\d)\b', s)
+        if m3:
+            d_val = int(m3.group(1))
+            m_val = int(m3.group(2))
+            y_val = m3.group(3)
+            if 1 <= m_val <= 12 and 1 <= d_val <= 31:
+                return f"{d_val:02d}/{m_val:02d}/{y_val}"
 
-    # Bước 3: Tìm ngày đứng ngay trước hoặc ngay sau mã Ref công văn
-    ref_m = re.search(r'QT1-[A-Za-z0-9_-]+', pre_body)
-    if ref_m:
-        start_pos = max(0, ref_m.start() - 100)
-        end_pos = min(len(pre_body), ref_m.end() + 100)
-        snippet_ref = pre_body[start_pos:end_pos]
-        # Loại bỏ các ngày có chữ 'dated'
-        cleaned_snippet = re.sub(r'dated\s+[A-Za-z0-9,\s]+', '', snippet_ref, flags=re.IGNORECASE)
-        d_ref = parse_date_to_dmy(cleaned_snippet)
-        if d_ref:
-            return d_ref
+        return ""
 
-    # Bước 4: Quét toàn bộ phần đầu thư (pre_body) nhưng bỏ qua các ngày đứng sau chữ 'dated'
-    cleaned_pre = re.sub(r'dated\s+[A-Za-z0-9,\s]+', '', pre_body, flags=re.IGNORECASE)
-    fallback_d = parse_date_to_dmy(cleaned_pre)
-    if fallback_d:
-        return fallback_d
+    # TẦNG 1: Tìm chữ Date đi liền trực tiếp với ngày tháng (bất kể dấu cách, xuống dòng)
+    p1 = r'\bDate\b[^\w\d]{0,35}(' + month_pat + r'\s+\d{1,2}(?:st|nd|rd|th)?,?\s+202\d|\d{1,2}(?:st|nd|rd|th)?\s+' + month_pat + r',?\s+202\d|\d{1,2}[\/.-]\d{1,2}[\/.-]202\d)'
+    m = re.search(p1, full_text, re.IGNORECASE)
+    if m:
+        res = parse_single_date(m.group(1))
+        if res: return res
 
-    return ""
+    # TẦNG 2: Tìm ngày nằm gần mã công văn QT1 (vùng cửa sổ +/- 200 ký tự xung quanh Ref)
+    for rm in re.finditer(r'QT1-[A-Za-z0-9_-]+', full_text):
+        snippet = full_text[max(0, rm.start() - 200): min(len(full_text), rm.end() + 200)]
+        snippet_clean = re.sub(r'\bdated\s+[^\n\r,]+', '', snippet, flags=re.IGNORECASE)
+        res = parse_single_date(snippet_clean)
+        if res: return res
+
+    # TẦNG 3: Quét toàn bộ văn bản nhưng loại trừ triệt để các ngày trích dẫn (đứng sau chữ 'dated')
+    text_clean = re.sub(r'\bdated\s+[^\n\r,]+', '', full_text, flags=re.IGNORECASE)
+    res = parse_single_date(text_clean)
+    if res: return res
+
+    # TẦNG 4: Quét vét toàn bộ văn bản
+    return parse_single_date(full_text)
 
 def extract_info_from_filename(filename: str):
     clean_name = os.path.splitext(filename or "")[0].strip()
@@ -174,7 +164,6 @@ def parse_cover_pdf_bytes(pdf_bytes, filename=""):
     full_extracted = p1_txt + "\n" + " ".join(visitor_parts)
 
     if full_extracted:
-        # 1. Tìm số công văn / số đệ trình
         ref_patterns = [
             r'(?:Ref\.?\s*(?:No\.?)?|Letter\s*(?:No\.?)?|TR\.?\s*(?:No\.?)?|Transmittal\s*(?:No\.?)?|No\.?)\s*[:\s]*([A-Za-z0-9_-]*QT1[A-Za-z0-9_-]+)',
             r'(QT1-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+-\d+)',
@@ -188,12 +177,10 @@ def parse_cover_pdf_bytes(pdf_bytes, filename=""):
                     metadata['tr_no'] = found_ref
                     break
         
-        # 2. Tìm ngày tháng bằng hàm chuẩn hóa mới
-        extracted_date = extract_letter_official_date(full_extracted)
+        extracted_date = find_letter_date_robust(full_extracted)
         if extracted_date:
             metadata['date_str'] = extracted_date
 
-        # 3. Tìm chủ đề (Subject)
         subj_m = re.search(r'(?:SUBJECT|Subject|Sub|V/v)\s*[:\s]+([^\n\r]+)', full_extracted)
         if subj_m:
             raw_subj = subj_m.group(1).strip()
@@ -201,7 +188,6 @@ def parse_cover_pdf_bytes(pdf_bytes, filename=""):
             if len(raw_subj) >= 5:
                 metadata['subject'] = raw_subj
 
-    # Ưu tiên dữ liệu chuẩn xác từ tên file nếu đọc trong PDF bị rỗng
     if (not metadata['tr_no'] or metadata['tr_no'] == 'QT1-Letter') and fn_doc_no:
         metadata['tr_no'] = fn_doc_no
     if (not metadata['subject'] or metadata['subject'] == 'Official Transmittal') and fn_subject:
@@ -312,7 +298,8 @@ async def export_zip_full(
     metadata: str = Form("{}"),
     mode: str = Form("auto_bump"),
     qti_no: str = Form("QTI-PECC1-PMB2-26-10-111"),
-    start_car_no: str = Form("9999")
+    start_car_no: str = Form("9999"),
+    custom_date: str = Form("")
 ):
     temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
     temp_zip_path = temp_zip.name
@@ -338,6 +325,10 @@ async def export_zip_full(
             elif cover_file.filename.lower().endswith(('.xlsx', '.xls')):
                 cover_data = parse_cover_excel_bytes(cover_bytes, cover_file.filename)
             del cover_bytes
+
+        # Ưu tiên ngày nhập tùy chỉnh nếu người dùng điền vào ô
+        if custom_date and custom_date.strip():
+            cover_data['date_str'] = custom_date.strip()
 
         vi_template_path = find_template("TV")
         if not vi_template_path: raise FileNotFoundError(f"Vui lòng copy file Word mẫu 'TVÐ1-NÐNLM.docx' vào thư mục: {BASE_DIR}")
@@ -740,7 +731,7 @@ async def export_zip_full(
                         print(f"Lỗi xử lý file {file.filename}: {fe}")
                         traceback.print_exc()
 
-            # 5. CHẾ ĐỘ TRẢ LỜI THƯ, KHÔNG CÓ CAR
+            # 5. TRẢ LỜI THƯ, KHÔNG CÓ CAR
             elif mode == "no_car_letter":
                 if cover_data['docs']:
                     for doc_k, d_info in cover_data['docs'].items():
@@ -782,8 +773,9 @@ async def export_zip_full(
                 if "Căn cứ" in p.text or "Công ty Cổ phần" in p.text:
                     p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
                 if "Căn cứ công văn số" in p.text:
-                    if not replace_value_after_keyword(p, "Căn cứ công văn số", f"{cover_data['tr_no']} ngày {cover_data['date_str']} của Nhà thầu EPC gói 15 về {cover_data['subject']}."):
-                        p.text = f"Căn cứ công văn số {cover_data['tr_no']} ngày {cover_data['date_str']} của Nhà thầu EPC gói 15 về {cover_data['subject']}."
+                    target_sentence = f"{cover_data['tr_no']} ngày {cover_data['date_str']} của Nhà thầu EPC gói 15 về {cover_data['subject']}."
+                    if not replace_value_after_keyword(p, "Căn cứ công văn số", target_sentence):
+                        p.text = f"Căn cứ công văn số {target_sentence}"
 
             vi_io = io.BytesIO()
             doc_vi.save(vi_io)
