@@ -38,7 +38,6 @@ def parse_single_date(s: str) -> str:
     }
     month_pat = r'(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)'
     
-    # 1. Month Day, Year (vd: October 19, 2026)
     m1 = re.search(r'\b(' + month_pat + r')\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(202\d)\b', s, re.IGNORECASE)
     if m1:
         m_str = m1.group(1).lower()
@@ -47,7 +46,6 @@ def parse_single_date(s: str) -> str:
         if m_str in month_map and 1 <= d_val <= 31:
             return f"{d_val:02d}/{month_map[m_str]:02d}/{y_val}"
 
-    # 2. Day Month Year (vd: 19 October 2026)
     m2 = re.search(r'\b(\d{1,2})(?:st|nd|rd|th)?\s+(' + month_pat + r'),?\s+(202\d)\b', s, re.IGNORECASE)
     if m2:
         d_val = int(m2.group(1))
@@ -56,7 +54,6 @@ def parse_single_date(s: str) -> str:
         if m_str in month_map and 1 <= d_val <= 31:
             return f"{d_val:02d}/{month_map[m_str]:02d}/{y_val}"
 
-    # 3. DD/MM/YYYY
     m3 = re.search(r'\b(\d{1,2})[\/.-](\d{1,2})[\/.-](202\d)\b', s)
     if m3:
         d_val = int(m3.group(1))
@@ -68,22 +65,18 @@ def parse_single_date(s: str) -> str:
     return ""
 
 def extract_ironclad_date(full_text: str, target_doc_no: str = "") -> str:
-    """Thuật toán thanh trừng sạch tài liệu tham khảo để bắt đúng ngày phát hành thư"""
     month_pat = r'(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)'
     
-    # BƯỚC 1: XÓA SỔ TOÀN BỘ KHỐI REFERENCE(S) VÀ CÁC DÒNG DATED
     purged_text = re.sub(r'Reference\(s\)[\s\S]*?(?=Dear\s+Sir|Date:|Ref\.|\Z)', '', full_text, flags=re.IGNORECASE)
     purged_text = re.sub(r'\bdated\s+[^\n\r]+', '', purged_text, flags=re.IGNORECASE)
     purged_text = re.sub(r'\bContract\s+Agreement[^\n\r]+', '', purged_text, flags=re.IGNORECASE)
 
-    # BƯỚC 2: BẮT TRỰC TIẾP Ô 'Date:' TRÊN TOÀN BỘ VĂN BẢN ĐÃ THANH TRÙNG
     p_date = r'\bDate\b\s*[:\s-]*\s*(' + month_pat + r'\s+\d{1,2}(?:st|nd|rd|th)?,?\s+202\d|\d{1,2}(?:st|nd|rd|th)?\s+' + month_pat + r',?\s+202\d|\d{1,2}[\/.-]\d{1,2}[\/.-]202\d)'
     m_direct = re.search(p_date, purged_text, re.IGNORECASE)
     if m_direct:
         res = parse_single_date(m_direct.group(1))
         if res: return res
 
-    # BƯỚC 3: NẾU CÓ MÃ REF ĐÍCH (VD: QT1-HDS-PMB2-L-2349), BẮT NGÀY TRONG VÙNG +/- 150 KÝ TỰ CỦA NÓ
     if target_doc_no:
         idx = purged_text.find(target_doc_no)
         if idx != -1:
@@ -91,7 +84,6 @@ def extract_ironclad_date(full_text: str, target_doc_no: str = "") -> str:
             res = parse_single_date(snippet)
             if res: return res
 
-    # BƯỚC 4: QUÉT VÉT TRÊN VĂN BẢN ĐÃ LỌC BỎ THAM CHIẾU
     res = parse_single_date(purged_text)
     if res: return res
 
@@ -332,7 +324,6 @@ async def export_zip_full(
                 cover_data = parse_cover_excel_bytes(cover_bytes, cover_file.filename)
             del cover_bytes
 
-        # Nếu người dùng có nhập đè ngày từ giao diện web thì ưu tiên tuyệt đối
         if custom_date and custom_date.strip():
             cover_data['date_str'] = custom_date.strip()
 
@@ -349,14 +340,11 @@ async def export_zip_full(
             start_num = 9999
 
         with zipfile.ZipFile(temp_zip_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-            
-            # XỬ LÝ CÁC CHẾ ĐỘ CÓ FILE CAR
             if mode != "no_car_letter" and files:
                 for file_idx, file in enumerate(files):
                     try:
                         content = await file.read()
 
-                        # 1. AUTO BUMP
                         if mode == "auto_bump":
                             wb = openpyxl.load_workbook(io.BytesIO(content))
                             max_r = 1
@@ -425,319 +413,315 @@ async def export_zip_full(
                                     tgt_c = new_ws.cell(row=r, column=new_com_col)
                                     if src_c.has_style:
                                         tgt_c.font, tgt_c.border, tgt_c.fill, tgt_c.alignment = copy(src_c.font), copy(src_c.border), copy(src_c.fill), copy(src_c.alignment)
-                            if prev_rep_col:
-                                src_r = new_ws.cell(row=r, column=prev_rep_col)
-                                tgt_r = new_ws.cell(row=r, column=new_rep_col)
-                                if src_r.has_style:
-                                    tgt_r.font, tgt_r.border, tgt_r.fill, tgt_r.alignment = copy(src_r.font), copy(src_r.border), copy(src_r.fill), copy(src_r.alignment)
+                                if prev_rep_col:
+                                    src_r = new_ws.cell(row=r, column=prev_rep_col)
+                                    tgt_r = new_ws.cell(row=r, column=new_rep_col)
+                                    if src_r.has_style:
+                                        tgt_r.font, tgt_r.border, tgt_r.fill, tgt_r.alignment = copy(src_r.font), copy(src_r.border), copy(src_r.fill), copy(src_r.alignment)
 
-                        status_full_text = "APPROVED (APP)" if selected_status == "APP" else "RETURN FOR CORRECTIONS (RFC)"
-                        if selected_status == "AWC": status_full_text = "APPROVED WITH COMMENTS (AWC)"
-                        elif selected_status == "RJ": status_full_text = "REJECTED (RJ)"
-                        
-                        new_ws.cell(row=12, column=new_com_col).value = f"STATUS AFTER ROUND {new_r_num} COMMENTS:"
-                        new_ws.cell(row=13, column=new_com_col).value = status_full_text
-
-                        for r in range(1, 15):
-                            for c in range(1, new_ws.max_column + 1):
-                                cell = new_ws.cell(row=r, column=c)
-                                if cell.value and cell.font:
-                                    f = cell.font
-                                    color = f.color if f.color else None
-                                    cell.font = Font(name=f.name, size=f.sz, bold=True, italic=f.i, color=color)
-
-                        red_bold = Font(name="Arial", size=10, bold=True, color="FFFF0000")
-                        new_ws.cell(row=12, column=new_com_col).font = red_bold
-                        new_ws.cell(row=13, column=new_com_col).font = red_bold
-
-                        for r in range(14, new_ws.max_row + 1):
-                            v_prev_c = str(new_ws.cell(row=r, column=prev_com_col).value or "").strip() if prev_com_col else ""
-                            v_prev_r = str(new_ws.cell(row=r, column=prev_rep_col).value or "").strip() if prev_rep_col else ""
+                            status_full_text = "APPROVED (APP)" if selected_status == "APP" else "RETURN FOR CORRECTIONS (RFC)"
+                            if selected_status == "AWC": status_full_text = "APPROVED WITH COMMENTS (AWC)"
+                            elif selected_status == "RJ": status_full_text = "REJECTED (RJ)"
                             
-                            if prev_com_col:
-                                src_c = new_ws.cell(row=r, column=prev_com_col)
-                                tgt_c = new_ws.cell(row=r, column=new_com_col)
-                                if src_c.has_style:
-                                    tgt_c.font, tgt_c.border, tgt_c.alignment = copy(src_c.font), copy(src_c.border), copy(src_c.alignment)
+                            new_ws.cell(row=12, column=new_com_col).value = f"STATUS AFTER ROUND {new_r_num} COMMENTS:"
+                            new_ws.cell(row=13, column=new_com_col).value = status_full_text
 
-                            is_group = "general comment" in v_prev_c.lower() or "detailed comment" in v_prev_c.lower()
-                            if is_group:
-                                new_ws.cell(row=r, column=new_com_col).value = None
-                            elif v_prev_c or v_prev_r:
-                                if selected_status == "APP":
-                                    new_ws.cell(row=r, column=new_com_col).value = "Noted."
+                            for r in range(1, 15):
+                                for c in range(1, new_ws.max_column + 1):
+                                    cell = new_ws.cell(row=r, column=c)
+                                    if cell.value and cell.font:
+                                        f = cell.font
+                                        color = f.color if f.color else None
+                                        cell.font = Font(name=f.name, size=f.sz, bold=True, italic=f.i, color=color)
+
+                            red_bold = Font(name="Arial", size=10, bold=True, color="FFFF0000")
+                            new_ws.cell(row=12, column=new_com_col).font = red_bold
+                            new_ws.cell(row=13, column=new_com_col).font = red_bold
+
+                            for r in range(14, new_ws.max_row + 1):
+                                v_prev_c = str(new_ws.cell(row=r, column=prev_com_col).value or "").strip() if prev_com_col else ""
+                                v_prev_r = str(new_ws.cell(row=r, column=prev_rep_col).value or "").strip() if prev_rep_col else ""
+                                
+                                if prev_com_col:
+                                    src_c = new_ws.cell(row=r, column=prev_com_col)
+                                    tgt_c = new_ws.cell(row=r, column=new_com_col)
+                                    if src_c.has_style:
+                                        tgt_c.font, tgt_c.border, tgt_c.alignment = copy(src_c.font), copy(src_c.border), copy(src_c.alignment)
+
+                                is_group = "general comment" in v_prev_c.lower() or "detailed comment" in v_prev_c.lower()
+                                if is_group:
+                                    new_ws.cell(row=r, column=new_com_col).value = None
+                                elif v_prev_c or v_prev_r:
+                                    if selected_status == "APP":
+                                        new_ws.cell(row=r, column=new_com_col).value = "Noted."
+                                else:
+                                    new_ws.cell(row=r, column=new_com_col).value = None
+
+                            new_ws.column_dimensions[openpyxl.utils.get_column_letter(new_com_col)].width = 38
+                            new_ws.column_dimensions[openpyxl.utils.get_column_letter(new_rep_col)].width = 38
+
+                            safe_title_for_name = clean_safe_filename(final_title)
+                            new_excel_name = f"{car_base} R{new_r_num} {current_date_str} {final_doc_no} {safe_title_for_name} rev.{final_rev}.xlsx"
+
+                            excel_out = io.BytesIO()
+                            wb.save(excel_out)
+                            zip_file.writestr(new_excel_name, excel_out.getvalue())
+                            del wb, excel_out
+
+                            processed_car_list.append({
+                                'doc_no': final_doc_no,
+                                'rev': final_rev,
+                                'title': final_title,
+                                'status': status_full_text,
+                                'car_label': f"{car_base} R{new_r_num}",
+                                'assigned_car_name': new_excel_name
+                            })
+
+                        elif mode == "number_filled_cars":
+                            cur_num = start_num + file_idx
+                            car_base = f"{cur_num:04d} CaRs" if cur_num < 10000 else f"{cur_num} CaRs"
+                            
+                            wb = openpyxl.load_workbook(io.BytesIO(content))
+                            max_r = 1
+                            target_ws = wb.active
+                            for s_name in wb.sheetnames:
+                                m = re.search(r'round\s*(\d+)', s_name, re.IGNORECASE)
+                                if m and int(m.group(1)) >= max_r:
+                                    max_r = int(m.group(1))
+                                    target_ws = wb[s_name]
+
+                            car_label = f"{car_base} R{max_r}"
+
+                            detected_doc_code = extract_clean_doc_no(file.filename)
+                            detected_title = ""
+                            for c in range(1, target_ws.max_column + 1):
+                                r4_val = str(target_ws.cell(row=4, column=c).value or "")
+                                extracted = extract_clean_doc_no(r4_val)
+                                if extracted: detected_doc_code = extracted
+                                r5_val = str(target_ws.cell(row=5, column=c).value or "").strip()
+                                if r5_val and not detected_title:
+                                    detected_title = re.sub(r'_(IFA|APD|IFI|RI|HDEC|Reply).*$', '', r5_val, flags=re.IGNORECASE).strip()
+
+                            doc_keys = list(cover_data['docs'].keys())
+                            if (not detected_doc_code or detected_doc_code not in cover_data['docs']) and file_idx < len(doc_keys):
+                                cover_info = cover_data['docs'][doc_keys[file_idx]]
+                                final_doc_no = cover_info['doc_no']
+                                final_rev = cover_info['rev']
+                                final_title = cover_info['title']
                             else:
-                                new_ws.cell(row=r, column=new_com_col).value = None
+                                cover_info = cover_data['docs'].get(detected_doc_code, {})
+                                final_doc_no = cover_info.get('doc_no', detected_doc_code if detected_doc_code else f"QT1-Doc-{cur_num}")
+                                final_rev = cover_info.get('rev', '1')
+                                final_title = cover_info.get('title', detected_title if detected_title else "Document")
 
-                        new_ws.column_dimensions[openpyxl.utils.get_column_letter(new_com_col)].width = 38
-                        new_ws.column_dimensions[openpyxl.utils.get_column_letter(new_rep_col)].width = 38
+                            for c in range(1, 10):
+                                v = str(target_ws.cell(row=1, column=c).value or "")
+                                if re.search(r'CaRs?', v, re.IGNORECASE) or (c == 5 and v):
+                                    target_ws.cell(row=1, column=c).value = f"{car_base} - R{max_r}"
+                                    break
 
-                        safe_title_for_name = clean_safe_filename(final_title)
-                        new_excel_name = f"{car_base} R{new_r_num} {current_date_str} {final_doc_no} {safe_title_for_name} rev.{final_rev}.xlsx"
+                            com_col = None
+                            for c in range(1, target_ws.max_column + 1):
+                                val_h = str(target_ws.cell(row=11, column=c).value or "").upper()
+                                if f"ROUND {max_r} COMMENTS" in val_h or f"ROUND {max_r} COMMENT" in val_h:
+                                    com_col = c
+                                    break
 
-                        excel_out = io.BytesIO()
-                        wb.save(excel_out)
-                        zip_file.writestr(new_excel_name, excel_out.getvalue())
-                        del wb, excel_out
+                            selected_status = car_metadata.get(file.filename, None)
+                            if not selected_status:
+                                selected_status = get_latest_status_from_ws(target_ws, max_r)
 
-                        processed_car_list.append({
-                            'doc_no': final_doc_no,
-                            'rev': final_rev,
-                            'title': final_title,
-                            'status': status_full_text,
-                            'car_label': f"{car_base} R{new_r_num}",
-                            'assigned_car_name': new_excel_name
-                        })
+                            status_full_text = "APPROVED (APP)" if selected_status == "APP" else "RETURN FOR CORRECTIONS (RFC)"
+                            if selected_status == "AWC": status_full_text = "APPROVED WITH COMMENTS (AWC)"
+                            elif selected_status == "RJ": status_full_text = "REJECTED (RJ)"
 
-                    # 2. NUMBER FILLED CARS
-                    elif mode == "number_filled_cars":
-                        cur_num = start_num + file_idx
-                        car_base = f"{cur_num:04d} CaRs" if cur_num < 10000 else f"{cur_num} CaRs"
-                        
-                        wb = openpyxl.load_workbook(io.BytesIO(content))
-                        max_r = 1
-                        target_ws = wb.active
-                        for s_name in wb.sheetnames:
-                            m = re.search(r'round\s*(\d+)', s_name, re.IGNORECASE)
-                            if m and int(m.group(1)) >= max_r:
-                                max_r = int(m.group(1))
-                                target_ws = wb[s_name]
+                            if com_col:
+                                target_ws.cell(row=2, column=com_col).value = "EVNPMB2"
+                                target_ws.cell(row=3, column=com_col).value = cover_data['tr_no']
+                                target_ws.cell(row=4, column=com_col).value = f"{final_doc_no} rev.{final_rev}"
+                                target_ws.cell(row=5, column=com_col).value = final_title
+                                target_ws.cell(row=12, column=com_col).value = f"STATUS AFTER ROUND {max_r} COMMENTS:"
+                                target_ws.cell(row=13, column=com_col).value = status_full_text
+                                
+                                red_bold = Font(name="Arial", size=10, bold=True, color="FFFF0000")
+                                target_ws.cell(row=12, column=com_col).font = red_bold
+                                target_ws.cell(row=13, column=com_col).font = red_bold
 
-                        car_label = f"{car_base} R{max_r}"
+                            safe_title_for_name = clean_safe_filename(final_title)
+                            new_excel_name = f"{car_base} R{max_r} {current_date_str} {final_doc_no} {safe_title_for_name} rev.{final_rev}.xlsx"
 
-                        detected_doc_code = extract_clean_doc_no(file.filename)
-                        detected_title = ""
-                        for c in range(1, target_ws.max_column + 1):
-                            r4_val = str(target_ws.cell(row=4, column=c).value or "")
-                            extracted = extract_clean_doc_no(r4_val)
-                            if extracted: detected_doc_code = extracted
-                            r5_val = str(target_ws.cell(row=5, column=c).value or "").strip()
-                            if r5_val and not detected_title:
-                                detected_title = re.sub(r'_(IFA|APD|IFI|RI|HDEC|Reply).*$', '', r5_val, flags=re.IGNORECASE).strip()
+                            excel_out = io.BytesIO()
+                            wb.save(excel_out)
+                            zip_file.writestr(new_excel_name, excel_out.getvalue())
+                            del wb, excel_out
 
-                        doc_keys = list(cover_data['docs'].keys())
-                        if (not detected_doc_code or detected_doc_code not in cover_data['docs']) and file_idx < len(doc_keys):
-                            cover_info = cover_data['docs'][doc_keys[file_idx]]
-                            final_doc_no = cover_info['doc_no']
-                            final_rev = cover_info['rev']
-                            final_title = cover_info['title']
-                        else:
-                            cover_info = cover_data['docs'].get(detected_doc_code, {})
-                            final_doc_no = cover_info.get('doc_no', detected_doc_code if detected_doc_code else f"QT1-Doc-{cur_num}")
-                            final_rev = cover_info.get('rev', '1')
-                            final_title = cover_info.get('title', detected_title if detected_title else "Document")
+                            processed_car_list.append({
+                                'doc_no': final_doc_no,
+                                'rev': final_rev,
+                                'title': final_title,
+                                'status': status_full_text,
+                                'car_label': car_label,
+                                'assigned_car_name': new_excel_name
+                            })
 
-                        for c in range(1, 10):
-                            v = str(target_ws.cell(row=1, column=c).value or "")
-                            if re.search(r'CaRs?', v, re.IGNORECASE) or (c == 5 and v):
-                                target_ws.cell(row=1, column=c).value = f"{car_base} - R{max_r}"
-                                break
+                        elif mode == "new_cars":
+                            cur_num = start_num + file_idx
+                            car_base = f"{cur_num:04d} CaRs" if cur_num < 10000 else f"{cur_num} CaRs"
+                            car_label = f"{car_base} R1"
+                            selected_status = car_metadata.get(file.filename, "APP")
 
-                        com_col = None
-                        for c in range(1, target_ws.max_column + 1):
-                            val_h = str(target_ws.cell(row=11, column=c).value or "").upper()
-                            if f"ROUND {max_r} COMMENTS" in val_h or f"ROUND {max_r} COMMENT" in val_h:
-                                com_col = c
-                                break
+                            wb = openpyxl.load_workbook(io.BytesIO(content))
+                            target_ws = wb.active
+                            for s_name in wb.sheetnames:
+                                if re.search(r'round\s*1', s_name, re.IGNORECASE):
+                                    target_ws = wb[s_name]
+                                    break
+                            target_ws.title = "ROUND 1 CaRs"
 
-                        selected_status = car_metadata.get(file.filename, None)
-                        if not selected_status:
-                            selected_status = get_latest_status_from_ws(target_ws, max_r)
+                            detected_doc_code = extract_clean_doc_no(file.filename)
+                            detected_title = ""
+                            for c in range(1, target_ws.max_column + 1):
+                                r4_val = str(target_ws.cell(row=4, column=c).value or "")
+                                extracted = extract_clean_doc_no(r4_val)
+                                if extracted: detected_doc_code = extracted
+                                r5_val = str(target_ws.cell(row=5, column=c).value or "").strip()
+                                if r5_val and not detected_title:
+                                    detected_title = re.sub(r'_(IFA|APD|IFI|RI|HDEC|Reply).*$', '', r5_val, flags=re.IGNORECASE).strip()
 
-                        status_full_text = "APPROVED (APP)" if selected_status == "APP" else "RETURN FOR CORRECTIONS (RFC)"
-                        if selected_status == "AWC": status_full_text = "APPROVED WITH COMMENTS (AWC)"
-                        elif selected_status == "RJ": status_full_text = "REJECTED (RJ)"
+                            doc_keys = list(cover_data['docs'].keys())
+                            if (not detected_doc_code or detected_doc_code not in cover_data['docs']) and file_idx < len(doc_keys):
+                                cover_info = cover_data['docs'][doc_keys[file_idx]]
+                                final_doc_no = cover_info['doc_no']
+                                final_rev = cover_info['rev']
+                                final_title = cover_info['title']
+                            else:
+                                cover_info = cover_data['docs'].get(detected_doc_code, {})
+                                final_doc_no = cover_info.get('doc_no', detected_doc_code if detected_doc_code else f"QT1-Doc-{cur_num}")
+                                final_rev = cover_info.get('rev', '1')
+                                final_title = cover_info.get('title', detected_title if detected_title else "Document")
 
-                        if com_col:
+                            row1_done = False
+                            for c in range(1, 10):
+                                v = str(target_ws.cell(row=1, column=c).value or "")
+                                if re.search(r'CaRs?', v, re.IGNORECASE) or (c == 5 and v):
+                                    target_ws.cell(row=1, column=c).value = f"{car_base} - R1"
+                                    row1_done = True
+                                    break
+                            if not row1_done:
+                                target_ws.cell(row=1, column=5).value = f"{car_base} - R1"
+
+                            com_col, rep_col = None, None
+                            for c in range(1, target_ws.max_column + 1):
+                                val_h = str(target_ws.cell(row=11, column=c).value or "").upper()
+                                if "ROUND 1 COMMENTS" in val_h or "ROUND 1 COMMENT" in val_h:
+                                    com_col = c
+                                elif "ROUND 1 REPLIES" in val_h or "ROUND 1 REPLY" in val_h:
+                                    rep_col = c
+
+                            if not com_col: com_col = 8
+                            if not rep_col: rep_col = com_col + 2
+
                             target_ws.cell(row=2, column=com_col).value = "EVNPMB2"
                             target_ws.cell(row=3, column=com_col).value = cover_data['tr_no']
                             target_ws.cell(row=4, column=com_col).value = f"{final_doc_no} rev.{final_rev}"
                             target_ws.cell(row=5, column=com_col).value = final_title
-                            target_ws.cell(row=12, column=com_col).value = f"STATUS AFTER ROUND {max_r} COMMENTS:"
+                            target_ws.cell(row=10, column=rep_col).value = "CONTRACTOR's"
+                            target_ws.cell(row=11, column=com_col).value = "ROUND 1 COMMENTS"
+                            target_ws.cell(row=11, column=rep_col).value = "ROUND 1 REPLIES"
+
+                            status_full_text = "APPROVED (APP)" if selected_status == "APP" else "RETURN FOR CORRECTIONS (RFC)"
+                            if selected_status == "AWC": status_full_text = "APPROVED WITH COMMENTS (AWC)"
+                            elif selected_status == "RJ": status_full_text = "REJECTED (RJ)"
+
+                            target_ws.cell(row=12, column=com_col).value = "STATUS AFTER ROUND 1 COMMENTS:"
                             target_ws.cell(row=13, column=com_col).value = status_full_text
-                            
+
+                            for r in range(1, 15):
+                                for c in range(1, target_ws.max_column + 1):
+                                    cell = target_ws.cell(row=r, column=c)
+                                    if cell.value and cell.font:
+                                        f = cell.font
+                                        color = f.color if f.color else None
+                                        cell.font = Font(name=f.name, size=f.sz, bold=True, italic=f.i, color=color)
+
                             red_bold = Font(name="Arial", size=10, bold=True, color="FFFF0000")
                             target_ws.cell(row=12, column=com_col).font = red_bold
                             target_ws.cell(row=13, column=com_col).font = red_bold
 
-                        safe_title_for_name = clean_safe_filename(final_title)
-                        new_excel_name = f"{car_base} R{max_r} {current_date_str} {final_doc_no} {safe_title_for_name} rev.{final_rev}.xlsx"
+                            target_ws.column_dimensions[openpyxl.utils.get_column_letter(com_col)].width = 38
+                            target_ws.column_dimensions[openpyxl.utils.get_column_letter(rep_col)].width = 38
 
-                        excel_out = io.BytesIO()
-                        wb.save(excel_out)
-                        zip_file.writestr(new_excel_name, excel_out.getvalue())
-                        del wb, excel_out
+                            safe_title_for_name = clean_safe_filename(final_title)
+                            new_excel_name = f"{car_base} R1 {current_date_str} {final_doc_no} {safe_title_for_name} rev.{final_rev}.xlsx"
 
-                        processed_car_list.append({
-                            'doc_no': final_doc_no,
-                            'rev': final_rev,
-                            'title': final_title,
-                            'status': status_full_text,
-                            'car_label': car_label,
-                            'assigned_car_name': new_excel_name
-                        })
+                            excel_out = io.BytesIO()
+                            wb.save(excel_out)
+                            zip_file.writestr(new_excel_name, excel_out.getvalue())
+                            del wb, excel_out
 
-                    # 3. NEW CARS
-                    elif mode == "new_cars":
-                        cur_num = start_num + file_idx
-                        car_base = f"{cur_num:04d} CaRs" if cur_num < 10000 else f"{cur_num} CaRs"
-                        car_label = f"{car_base} R1"
-                        selected_status = car_metadata.get(file.filename, "APP")
+                            processed_car_list.append({
+                                'doc_no': final_doc_no,
+                                'rev': final_rev,
+                                'title': final_title,
+                                'status': status_full_text,
+                                'car_label': car_label,
+                                'assigned_car_name': new_excel_name
+                            })
 
-                        wb = openpyxl.load_workbook(io.BytesIO(content))
-                        target_ws = wb.active
-                        for s_name in wb.sheetnames:
-                            if re.search(r'round\s*1', s_name, re.IGNORECASE):
-                                target_ws = wb[s_name]
-                                break
-                        target_ws.title = "ROUND 1 CaRs"
-
-                        detected_doc_code = extract_clean_doc_no(file.filename)
-                        detected_title = ""
-                        for c in range(1, target_ws.max_column + 1):
-                            r4_val = str(target_ws.cell(row=4, column=c).value or "")
-                            extracted = extract_clean_doc_no(r4_val)
-                            if extracted: detected_doc_code = extracted
-                            r5_val = str(target_ws.cell(row=5, column=c).value or "").strip()
-                            if r5_val and not detected_title:
-                                detected_title = re.sub(r'_(IFA|APD|IFI|RI|HDEC|Reply).*$', '', r5_val, flags=re.IGNORECASE).strip()
-
-                        doc_keys = list(cover_data['docs'].keys())
-                        if (not detected_doc_code or detected_doc_code not in cover_data['docs']) and file_idx < len(doc_keys):
-                            cover_info = cover_data['docs'][doc_keys[file_idx]]
-                            final_doc_no = cover_info['doc_no']
-                            final_rev = cover_info['rev']
-                            final_title = cover_info['title']
                         else:
+                            wb_ro = openpyxl.load_workbook(io.BytesIO(content), read_only=True)
+                            max_r = 1
+                            target_sheet_name = wb_ro.sheetnames[0]
+                            for s_name in wb_ro.sheetnames:
+                                m = re.search(r'round\s*(\d+)', s_name, re.IGNORECASE)
+                                if m and int(m.group(1)) >= max_r:
+                                    max_r = int(m.group(1))
+                                    target_sheet_name = s_name
+
+                            source_ws = wb_ro[target_sheet_name]
+                            car_p = re.search(r'(\d{4,}\s*CaRs)', file.filename, re.IGNORECASE)
+                            car_base = car_p.group(1) if car_p else "CaRs"
+
+                            detected_doc_code = extract_clean_doc_no(file.filename)
+                            detected_title = ""
+                            for row in source_ws.iter_rows(min_row=4, max_row=5, values_only=True):
+                                for cell_val in row:
+                                    val_str = str(cell_val or "").strip()
+                                    if not detected_doc_code:
+                                        extracted = extract_clean_doc_no(val_str)
+                                        if extracted: detected_doc_code = extracted
+                                    if val_str and not detected_title:
+                                        detected_title = re.sub(r'_(IFA|APD|IFI|RI|HDEC|Reply).*$', '', val_str, flags=re.IGNORECASE).strip()
+
                             cover_info = cover_data['docs'].get(detected_doc_code, {})
-                            final_doc_no = cover_info.get('doc_no', detected_doc_code if detected_doc_code else f"QT1-Doc-{cur_num}")
+                            final_doc_no = cover_info.get('doc_no', detected_doc_code if detected_doc_code else "QT1-Document")
                             final_rev = cover_info.get('rev', '1')
                             final_title = cover_info.get('title', detected_title if detected_title else "Document")
+                            
+                            actual_status_raw = get_latest_status_from_ws(source_ws, max_r)
+                            status_full_text = "APPROVED (APP)" if actual_status_raw == "APP" else "RETURN FOR CORRECTIONS (RFC)"
+                            if actual_status_raw == "AWC": status_full_text = "APPROVED WITH COMMENTS (AWC)"
+                            elif actual_status_raw == "RJ": status_full_text = "REJECTED (RJ)"
 
-                        row1_done = False
-                        for c in range(1, 10):
-                            v = str(target_ws.cell(row=1, column=c).value or "")
-                            if re.search(r'CaRs?', v, re.IGNORECASE) or (c == 5 and v):
-                                target_ws.cell(row=1, column=c).value = f"{car_base} - R1"
-                                row1_done = True
-                                break
-                        if not row1_done:
-                            target_ws.cell(row=1, column=5).value = f"{car_base} - R1"
+                            del wb_ro
+                            zip_file.writestr(clean_safe_filename(file.filename), content)
+                            
+                            processed_car_list.append({
+                                'doc_no': final_doc_no,
+                                'rev': final_rev,
+                                'title': final_title,
+                                'status': status_full_text,
+                                'car_label': f"{car_base} R{max_r}",
+                                'assigned_car_name': file.filename
+                            })
 
-                        com_col, rep_col = None, None
-                        for c in range(1, target_ws.max_column + 1):
-                            val_h = str(target_ws.cell(row=11, column=c).value or "").upper()
-                            if "ROUND 1 COMMENTS" in val_h or "ROUND 1 COMMENT" in val_h:
-                                com_col = c
-                            elif "ROUND 1 REPLIES" in val_h or "ROUND 1 REPLY" in val_h:
-                                rep_col = c
+                        del content
+                        gc.collect()
 
-                        if not com_col: com_col = 8
-                        if not rep_col: rep_col = com_col + 2
+                    except Exception as fe:
+                        print(f"Lỗi xử lý file {file.filename}: {fe}")
+                        traceback.print_exc()
 
-                        target_ws.cell(row=2, column=com_col).value = "EVNPMB2"
-                        target_ws.cell(row=3, column=com_col).value = cover_data['tr_no']
-                        target_ws.cell(row=4, column=com_col).value = f"{final_doc_no} rev.{final_rev}"
-                        target_ws.cell(row=5, column=com_col).value = final_title
-                        target_ws.cell(row=10, column=rep_col).value = "CONTRACTOR's"
-                        target_ws.cell(row=11, column=com_col).value = "ROUND 1 COMMENTS"
-                        target_ws.cell(row=11, column=rep_col).value = "ROUND 1 REPLIES"
-
-                        status_full_text = "APPROVED (APP)" if selected_status == "APP" else "RETURN FOR CORRECTIONS (RFC)"
-                        if selected_status == "AWC": status_full_text = "APPROVED WITH COMMENTS (AWC)"
-                        elif selected_status == "RJ": status_full_text = "REJECTED (RJ)"
-
-                        target_ws.cell(row=12, column=com_col).value = "STATUS AFTER ROUND 1 COMMENTS:"
-                        target_ws.cell(row=13, column=com_col).value = status_full_text
-
-                        for r in range(1, 15):
-                            for c in range(1, target_ws.max_column + 1):
-                                cell = target_ws.cell(row=r, column=c)
-                                if cell.value and cell.font:
-                                    f = cell.font
-                                    color = f.color if f.color else None
-                                    cell.font = Font(name=f.name, size=f.sz, bold=True, italic=f.i, color=color)
-
-                        red_bold = Font(name="Arial", size=10, bold=True, color="FFFF0000")
-                        target_ws.cell(row=12, column=com_col).font = red_bold
-                        target_ws.cell(row=13, column=com_col).font = red_bold
-
-                        target_ws.column_dimensions[openpyxl.utils.get_column_letter(com_col)].width = 38
-                        target_ws.column_dimensions[openpyxl.utils.get_column_letter(rep_col)].width = 38
-
-                        safe_title_for_name = clean_safe_filename(final_title)
-                        new_excel_name = f"{car_base} R1 {current_date_str} {final_doc_no} {safe_title_for_name} rev.{final_rev}.xlsx"
-
-                        excel_out = io.BytesIO()
-                        wb.save(excel_out)
-                        zip_file.writestr(new_excel_name, excel_out.getvalue())
-                        del wb, excel_out
-
-                        processed_car_list.append({
-                            'doc_no': final_doc_no,
-                            'rev': final_rev,
-                            'title': final_title,
-                            'status': status_full_text,
-                            'car_label': car_label,
-                            'assigned_car_name': new_excel_name
-                        })
-
-                    # 4. PRE PREPARED
-                    else:
-                        wb_ro = openpyxl.load_workbook(io.BytesIO(content), read_only=True)
-                        max_r = 1
-                        target_sheet_name = wb_ro.sheetnames[0]
-                        for s_name in wb_ro.sheetnames:
-                            m = re.search(r'round\s*(\d+)', s_name, re.IGNORECASE)
-                            if m and int(m.group(1)) >= max_r:
-                                max_r = int(m.group(1))
-                                target_sheet_name = s_name
-
-                        source_ws = wb_ro[target_sheet_name]
-                        car_p = re.search(r'(\d{4,}\s*CaRs)', file.filename, re.IGNORECASE)
-                        car_base = car_p.group(1) if car_p else "CaRs"
-
-                        detected_doc_code = extract_clean_doc_no(file.filename)
-                        detected_title = ""
-                        for row in source_ws.iter_rows(min_row=4, max_row=5, values_only=True):
-                            for cell_val in row:
-                                val_str = str(cell_val or "").strip()
-                                if not detected_doc_code:
-                                    extracted = extract_clean_doc_no(val_str)
-                                    if extracted: detected_doc_code = extracted
-                                if val_str and not detected_title:
-                                    detected_title = re.sub(r'_(IFA|APD|IFI|RI|HDEC|Reply).*$', '', val_str, flags=re.IGNORECASE).strip()
-
-                        cover_info = cover_data['docs'].get(detected_doc_code, {})
-                        final_doc_no = cover_info.get('doc_no', detected_doc_code if detected_doc_code else "QT1-Document")
-                        final_rev = cover_info.get('rev', '1')
-                        final_title = cover_info.get('title', detected_title if detected_title else "Document")
-                        
-                        actual_status_raw = get_latest_status_from_ws(source_ws, max_r)
-                        status_full_text = "APPROVED (APP)" if actual_status_raw == "APP" else "RETURN FOR CORRECTIONS (RFC)"
-                        if actual_status_raw == "AWC": status_full_text = "APPROVED WITH COMMENTS (AWC)"
-                        elif actual_status_raw == "RJ": status_full_text = "REJECTED (RJ)"
-
-                        del wb_ro
-                        zip_file.writestr(clean_safe_filename(file.filename), content)
-                        
-                        processed_car_list.append({
-                            'doc_no': final_doc_no,
-                            'rev': final_rev,
-                            'title': final_title,
-                            'status': status_full_text,
-                            'car_label': f"{car_base} R{max_r}",
-                            'assigned_car_name': file.filename
-                        })
-
-                    del content
-                    gc.collect()
-
-                except Exception as fe:
-                    print(f"Lỗi xử lý file {file.filename}: {fe}")
-                    traceback.print_exc()
-
-            # 5. TRẢ LỜI THƯ, KHÔNG CÓ CAR
             elif mode == "no_car_letter":
                 if cover_data['docs']:
                     for doc_k, d_info in cover_data['docs'].items():
@@ -761,9 +745,6 @@ async def export_zip_full(
 
             safe_subj_name = clean_safe_filename(cover_data['subject'])
 
-            # =========================================================================
-            # XUẤT TỜ TRÌNH TIẾNG VIỆT
-            # =========================================================================
             doc_vi = Document(vi_template_path)
             for tbl in doc_vi.tables:
                 for row in tbl.rows:
@@ -788,9 +769,6 @@ async def export_zip_full(
             zip_file.writestr(f"TVÐ1-NÐNLM {safe_subj_name}.docx", vi_io.getvalue())
             del vi_io, doc_vi
 
-            # =========================================================================
-            # XUẤT THƯ TIẾNG ANH
-            # =========================================================================
             doc_en = Document(en_template_path)
             doc_type_en = "Letter" if "-L-" in cover_data['tr_no'].upper() else "Transmittal"
 
