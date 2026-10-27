@@ -29,9 +29,9 @@ def clean_safe_filename(name: str) -> str:
     cleaned = re.sub(r'[\\/*?:"<>|]', '-', name).strip()
     return cleaned[:130] if len(cleaned) > 130 else cleaned
 
-def parse_date_to_dmy(text: str) -> str:
-    """Hàm bóc tách và chuẩn hóa ngày tháng tiếng Anh/tiếng Việt sang dạng DD/MM/YYYY"""
-    months = {
+def robust_extract_date(full_text: str) -> str:
+    """Hàm bóc tách ngày chuyên dụng xử lý toàn bộ các định dạng tiếng Anh / tiếng Việt"""
+    month_map = {
         'jan': 1, 'january': 1,
         'feb': 2, 'february': 2,
         'mar': 3, 'march': 3,
@@ -45,44 +45,75 @@ def parse_date_to_dmy(text: str) -> str:
         'nov': 11, 'november': 11,
         'dec': 12, 'december': 12
     }
+    month_pattern = r'(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)'
     
-    # 1. Dạng: October 19, 2026 hoặc Oct 19 2026
-    m1 = re.search(r'([A-Za-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(202\d)', text)
-    if m1:
-        mon_str = m1.group(1).lower()
-        if mon_str in months:
-            day = int(m1.group(2))
-            mon = months[mon_str]
-            yr = m1.group(3)
-            return f"{day:02d}/{mon:02d}/{yr}"
+    # 1. Tìm trực tiếp chữ Date kèm ngày tháng (ví dụ Date: October 19, 2026)
+    m_block1 = re.search(r'\bDate\b[^\w\n\r]*[:\s]*[^\w\n\r]*(' + month_pattern + r'\s+\d{1,2}(?:st|nd|rd|th)?,?\s+202\d)', full_text, re.IGNORECASE)
+    if m_block1:
+        sub_m = re.search(r'(' + month_pattern + r')\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(202\d)', m_block1.group(1), re.IGNORECASE)
+        if sub_m:
+            m_str = sub_m.group(1).lower()
+            d_val = int(sub_m.group(2))
+            y_val = sub_m.group(3)
+            if m_str in month_map:
+                return f"{d_val:02d}/{month_map[m_str]:02d}/{y_val}"
 
-    # 2. Dạng: 19 October 2026 hoặc 19 Oct 2026
-    m2 = re.search(r'(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]+),?\s+(202\d)', text)
-    if m2:
-        mon_str = m2.group(2).lower()
-        if mon_str in months:
-            day = int(m2.group(1))
-            mon = months[mon_str]
-            yr = m2.group(3)
-            return f"{day:02d}/{mon:02d}/{yr}"
+    # 1b. Dạng Date: 19 October 2026
+    m_block2 = re.search(r'\bDate\b[^\w\n\r]*[:\s]*[^\w\n\r]*(\d{1,2}(?:st|nd|rd|th)?\s+' + month_pattern + r',?\s+202\d)', full_text, re.IGNORECASE)
+    if m_block2:
+        sub_m = re.search(r'(\d{1,2})(?:st|nd|rd|th)?\s+(' + month_pattern + r'),?\s+(202\d)', m_block2.group(1), re.IGNORECASE)
+        if sub_m:
+            d_val = int(sub_m.group(1))
+            m_str = sub_m.group(2).lower()
+            y_val = sub_m.group(3)
+            if m_str in month_map:
+                return f"{d_val:02d}/{month_map[m_str]:02d}/{y_val}"
 
-    # 3. Dạng số: DD/MM/YYYY hoặc DD-MM-YYYY hoặc DD.MM.YYYY
-    m3 = re.search(r'(\d{1,2})[\/.-](\d{1,2})[\/.-](202\d)', text)
-    if m3:
-        day = int(m3.group(1))
-        mon = int(m3.group(2))
-        yr = m3.group(3)
-        if 1 <= mon <= 12 and 1 <= day <= 31:
-            return f"{day:02d}/{mon:02d}/{yr}"
+    # 1c. Dạng Date: 19/10/2026
+    m_block3 = re.search(r'\bDate\b[^\w\n\r]*[:\s]*[^\w\n\r]*(\d{1,2})[\/.-](\d{1,2})[\/.-](202\d)', full_text, re.IGNORECASE)
+    if m_block3:
+        d_val = int(m_block3.group(1))
+        m_val = int(m_block3.group(2))
+        y_val = m_block3.group(3)
+        if 1 <= m_val <= 12 and 1 <= d_val <= 31:
+            return f"{d_val:02d}/{m_val:02d}/{y_val}"
 
-    # 4. Dạng chuẩn: YYYY-MM-DD
-    m4 = re.search(r'(202\d)[\/.-](\d{1,2})[\/.-](\d{1,2})', text)
-    if m4:
-        yr = m4.group(1)
-        mon = int(m4.group(2))
-        day = int(m4.group(3))
-        if 1 <= mon <= 12 and 1 <= day <= 31:
-            return f"{day:02d}/{mon:02d}/{yr}"
+    # 2. Tìm tất cả các ngày trong 3000 ký tự đầu tiên, ưu tiên ngày gần mã QT1 nhất
+    ref_pos = -1
+    m_ref = re.search(r'QT1-[A-Za-z0-9_-]+', full_text)
+    if m_ref:
+        ref_pos = m_ref.start()
+
+    candidates = []
+    scope_text = full_text[:3000]
+
+    for m in re.finditer(r'\b(' + month_pattern + r')\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(202\d)\b', scope_text, re.IGNORECASE):
+        m_str = m.group(1).lower()
+        if m_str in month_map:
+            d_val = int(m.group(2))
+            y_val = m.group(3)
+            dist = abs(m.start() - ref_pos) if ref_pos >= 0 else m.start()
+            candidates.append((dist, f"{d_val:02d}/{month_map[m_str]:02d}/{y_val}"))
+
+    for m in re.finditer(r'\b(\d{1,2})(?:st|nd|rd|th)?\s+(' + month_pattern + r'),?\s+(202\d)\b', scope_text, re.IGNORECASE):
+        m_str = m.group(2).lower()
+        if m_str in month_map:
+            d_val = int(m.group(1))
+            y_val = m.group(3)
+            dist = abs(m.start() - ref_pos) if ref_pos >= 0 else m.start()
+            candidates.append((dist, f"{d_val:02d}/{month_map[m_str]:02d}/{y_val}"))
+
+    for m in re.finditer(r'\b(\d{1,2})[\/.-](\d{1,2})[\/.-](202\d)\b', scope_text):
+        d_val = int(m.group(1))
+        m_val = int(m.group(2))
+        y_val = m.group(3)
+        if 1 <= m_val <= 12 and 1 <= d_val <= 31:
+            dist = abs(m.start() - ref_pos) if ref_pos >= 0 else m.start()
+            candidates.append((dist, f"{d_val:02d}/{m_val:02d}/{y_val}"))
+
+    if candidates:
+        candidates.sort(key=lambda x: x[0])
+        return candidates[0][1]
 
     return ""
 
@@ -167,20 +198,10 @@ def parse_cover_pdf_bytes(pdf_bytes, filename=""):
                     metadata['tr_no'] = found_ref
                     break
         
-        # 2. Tìm ngày tháng (Đặc biệt xử lý các định dạng như Date: October 19, 2026)
-        date_m = re.search(r'Date\s*[:\s]+([^\n\r]+)', p1_txt, re.IGNORECASE)
-        date_found = False
-        if date_m:
-            parsed_d = parse_date_to_dmy(date_m.group(1))
-            if parsed_d:
-                metadata['date_str'] = parsed_d
-                date_found = True
-        
-        # Nếu chưa tìm thấy cạnh chữ Date, quét 500 ký tự đầu tiên
-        if not date_found:
-            fallback_d = parse_date_to_dmy(p1_txt[:500])
-            if fallback_d:
-                metadata['date_str'] = fallback_d
+        # 2. Tìm ngày tháng bằng hàm quét chuyên dụng
+        extracted_date = robust_extract_date(p1_txt)
+        if extracted_date:
+            metadata['date_str'] = extracted_date
 
         # 3. Tìm chủ đề (Subject)
         subj_m = re.search(r'(?:SUBJECT|Subject|Sub|V/v)\s*[:\s]+([^\n\r]+)', p1_txt)
@@ -190,7 +211,7 @@ def parse_cover_pdf_bytes(pdf_bytes, filename=""):
             if len(raw_subj) >= 5:
                 metadata['subject'] = raw_subj
 
-    # Ưu tiên dữ liệu chuẩn từ tên file nếu đọc trong PDF bị thiếu
+    # Ưu tiên dữ liệu từ tên file nếu đọc trong PDF bị thiếu
     if (not metadata['tr_no'] or metadata['tr_no'] == 'QT1-Letter') and fn_doc_no:
         metadata['tr_no'] = fn_doc_no
     if (not metadata['subject'] or metadata['subject'] == 'Official Transmittal') and fn_subject:
@@ -450,7 +471,7 @@ async def export_zip_full(
                                     src_c = new_ws.cell(row=r, column=prev_com_col)
                                     tgt_c = new_ws.cell(row=r, column=new_com_col)
                                     if src_c.has_style:
-                                        tgt_c.font, tgt_c.border, tgt_c.alignment = copy(src_c.font), copy(src_c.border), copy(src_c.alignment)
+                                        tgt_c.font, tgt_c.border, tgt_c.alignment = copy(src_c.font), copy(src_c.border), copy(src_c.fill), copy(src_c.alignment)
 
                                 is_group = "general comment" in v_prev_c.lower() or "detailed comment" in v_prev_c.lower()
                                 if is_group:
@@ -871,12 +892,6 @@ async def export_zip_full(
             safe_qti_name = clean_safe_filename(qti_no)
             zip_file.writestr(f"{safe_qti_name} {safe_subj_name}.docx", en_io.getvalue())
             del en_io, doc_en
-
-            summary_title = "TRẢ LỜI THƯ (KHÔNG CÓ CAR)" if mode == "no_car_letter" else "DANH SÁCH BỘ HỒ SƠ ĐÃ XUẤT"
-            summary_txt = f"{summary_title}:\n" + "="*50 + f"\nSố thư xuất: {qti_no}\nChủ đề: {cover_data['subject']}\nCăn cứ thư EPC: {cover_data['tr_no']} ({cover_data['date_str']})\n\n"
-            for item in processed_car_list:
-                summary_txt += f"• [{item['status']}] {item['doc_no']}: {item['title']}\n  Đính kèm: {item['assigned_car_name']}\n\n"
-            zip_file.writestr("00_TONG_HOP_KET_QUA.txt", summary_txt.encode('utf-8'))
 
         safe_qti_name = clean_safe_filename(qti_no)
         headers = {
