@@ -29,91 +29,75 @@ def clean_safe_filename(name: str) -> str:
     cleaned = re.sub(r'[\\/*?:"<>|]', '-', name).strip()
     return cleaned[:130] if len(cleaned) > 130 else cleaned
 
-def robust_extract_date(full_text: str) -> str:
-    """Hàm bóc tách ngày chuyên dụng xử lý toàn bộ các định dạng tiếng Anh / tiếng Việt"""
+def parse_date_to_dmy(text: str) -> str:
     month_map = {
-        'jan': 1, 'january': 1,
-        'feb': 2, 'february': 2,
-        'mar': 3, 'march': 3,
-        'apr': 4, 'april': 4,
-        'may': 5,
-        'jun': 6, 'june': 6,
-        'jul': 7, 'july': 7,
-        'aug': 8, 'august': 8,
-        'sep': 9, 'september': 9, 'sept': 9,
-        'oct': 10, 'october': 10,
-        'nov': 11, 'november': 11,
-        'dec': 12, 'december': 12
+        'jan': 1, 'january': 1, 'feb': 2, 'february': 2, 'mar': 3, 'march': 3,
+        'apr': 4, 'april': 4, 'may': 5, 'jun': 6, 'june': 6, 'jul': 7, 'july': 7,
+        'aug': 8, 'august': 8, 'sep': 9, 'september': 9, 'sept': 9,
+        'oct': 10, 'october': 10, 'nov': 11, 'november': 11, 'dec': 12, 'december': 12
     }
-    month_pattern = r'(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)'
+    month_pat = r'(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)'
     
-    # 1. Tìm trực tiếp chữ Date kèm ngày tháng (ví dụ Date: October 19, 2026)
-    m_block1 = re.search(r'\bDate\b[^\w\n\r]*[:\s]*[^\w\n\r]*(' + month_pattern + r'\s+\d{1,2}(?:st|nd|rd|th)?,?\s+202\d)', full_text, re.IGNORECASE)
-    if m_block1:
-        sub_m = re.search(r'(' + month_pattern + r')\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(202\d)', m_block1.group(1), re.IGNORECASE)
-        if sub_m:
-            m_str = sub_m.group(1).lower()
-            d_val = int(sub_m.group(2))
-            y_val = sub_m.group(3)
-            if m_str in month_map:
-                return f"{d_val:02d}/{month_map[m_str]:02d}/{y_val}"
+    # 1. Month Day, Year (vd: October 19, 2026)
+    m1 = re.search(r'\b(' + month_pat + r')\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(202\d)\b', text, re.IGNORECASE)
+    if m1:
+        m_str = m1.group(1).lower()
+        d_val = int(m1.group(2))
+        y_val = m1.group(3)
+        if m_str in month_map:
+            return f"{d_val:02d}/{month_map[m_str]:02d}/{y_val}"
+            
+    # 2. Day Month Year (vd: 19 October 2026)
+    m2 = re.search(r'\b(\d{1,2})(?:st|nd|rd|th)?\s+(' + month_pat + r'),?\s+(202\d)\b', text, re.IGNORECASE)
+    if m2:
+        d_val = int(m2.group(1))
+        m_str = m2.group(2).lower()
+        y_val = m2.group(3)
+        if m_str in month_map:
+            return f"{d_val:02d}/{month_map[m_str]:02d}/{y_val}"
 
-    # 1b. Dạng Date: 19 October 2026
-    m_block2 = re.search(r'\bDate\b[^\w\n\r]*[:\s]*[^\w\n\r]*(\d{1,2}(?:st|nd|rd|th)?\s+' + month_pattern + r',?\s+202\d)', full_text, re.IGNORECASE)
-    if m_block2:
-        sub_m = re.search(r'(\d{1,2})(?:st|nd|rd|th)?\s+(' + month_pattern + r'),?\s+(202\d)', m_block2.group(1), re.IGNORECASE)
-        if sub_m:
-            d_val = int(sub_m.group(1))
-            m_str = sub_m.group(2).lower()
-            y_val = sub_m.group(3)
-            if m_str in month_map:
-                return f"{d_val:02d}/{month_map[m_str]:02d}/{y_val}"
-
-    # 1c. Dạng Date: 19/10/2026
-    m_block3 = re.search(r'\bDate\b[^\w\n\r]*[:\s]*[^\w\n\r]*(\d{1,2})[\/.-](\d{1,2})[\/.-](202\d)', full_text, re.IGNORECASE)
-    if m_block3:
-        d_val = int(m_block3.group(1))
-        m_val = int(m_block3.group(2))
-        y_val = m_block3.group(3)
+    # 3. DD/MM/YYYY
+    m3 = re.search(r'\b(\d{1,2})[\/.-](\d{1,2})[\/.-](202\d)\b', text)
+    if m3:
+        d_val = int(m3.group(1))
+        m_val = int(m3.group(2))
+        y_val = m3.group(3)
         if 1 <= m_val <= 12 and 1 <= d_val <= 31:
             return f"{d_val:02d}/{m_val:02d}/{y_val}"
 
-    # 2. Tìm tất cả các ngày trong 3000 ký tự đầu tiên, ưu tiên ngày gần mã QT1 nhất
-    ref_pos = -1
-    m_ref = re.search(r'QT1-[A-Za-z0-9_-]+', full_text)
-    if m_ref:
-        ref_pos = m_ref.start()
+    return ""
 
-    candidates = []
-    scope_text = full_text[:3000]
+def extract_letter_official_date(full_text: str) -> str:
+    """Bóc tách chính xác ngày phát hành của thư, loại trừ triệt để các ngày trích dẫn"""
+    # Bước 1: Cắt bỏ toàn bộ phần sau chữ Reference(s) hoặc Dear Sir để loại trừ ngày trích dẫn cũ
+    pre_body = re.split(r'\b(?:Reference\(s\)|References|Dear\s+Sir)\b', full_text, flags=re.IGNORECASE)[0]
+    
+    # Bước 2: Tìm chữ Date đứng gần ngày tháng nhất (khoảng cách tối đa 50 ký tự)
+    date_matches = list(re.finditer(r'\bDate\b', pre_body, re.IGNORECASE))
+    if date_matches:
+        for dm in date_matches:
+            snippet = pre_body[dm.start(): dm.start() + 60]
+            d = parse_date_to_dmy(snippet)
+            if d:
+                return d
 
-    for m in re.finditer(r'\b(' + month_pattern + r')\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(202\d)\b', scope_text, re.IGNORECASE):
-        m_str = m.group(1).lower()
-        if m_str in month_map:
-            d_val = int(m.group(2))
-            y_val = m.group(3)
-            dist = abs(m.start() - ref_pos) if ref_pos >= 0 else m.start()
-            candidates.append((dist, f"{d_val:02d}/{month_map[m_str]:02d}/{y_val}"))
+    # Bước 3: Tìm ngày đứng ngay trước hoặc ngay sau mã Ref công văn
+    ref_m = re.search(r'QT1-[A-Za-z0-9_-]+', pre_body)
+    if ref_m:
+        start_pos = max(0, ref_m.start() - 100)
+        end_pos = min(len(pre_body), ref_m.end() + 100)
+        snippet_ref = pre_body[start_pos:end_pos]
+        # Loại bỏ các ngày có chữ 'dated'
+        cleaned_snippet = re.sub(r'dated\s+[A-Za-z0-9,\s]+', '', snippet_ref, flags=re.IGNORECASE)
+        d_ref = parse_date_to_dmy(cleaned_snippet)
+        if d_ref:
+            return d_ref
 
-    for m in re.finditer(r'\b(\d{1,2})(?:st|nd|rd|th)?\s+(' + month_pattern + r'),?\s+(202\d)\b', scope_text, re.IGNORECASE):
-        m_str = m.group(2).lower()
-        if m_str in month_map:
-            d_val = int(m.group(1))
-            y_val = m.group(3)
-            dist = abs(m.start() - ref_pos) if ref_pos >= 0 else m.start()
-            candidates.append((dist, f"{d_val:02d}/{month_map[m_str]:02d}/{y_val}"))
-
-    for m in re.finditer(r'\b(\d{1,2})[\/.-](\d{1,2})[\/.-](202\d)\b', scope_text):
-        d_val = int(m.group(1))
-        m_val = int(m.group(2))
-        y_val = m.group(3)
-        if 1 <= m_val <= 12 and 1 <= d_val <= 31:
-            dist = abs(m.start() - ref_pos) if ref_pos >= 0 else m.start()
-            candidates.append((dist, f"{d_val:02d}/{m_val:02d}/{y_val}"))
-
-    if candidates:
-        candidates.sort(key=lambda x: x[0])
-        return candidates[0][1]
+    # Bước 4: Quét toàn bộ phần đầu thư (pre_body) nhưng bỏ qua các ngày đứng sau chữ 'dated'
+    cleaned_pre = re.sub(r'dated\s+[A-Za-z0-9,\s]+', '', pre_body, flags=re.IGNORECASE)
+    fallback_d = parse_date_to_dmy(cleaned_pre)
+    if fallback_d:
+        return fallback_d
 
     return ""
 
@@ -176,14 +160,20 @@ def parse_cover_pdf_bytes(pdf_bytes, filename=""):
     }
     
     p1_txt = ""
+    visitor_parts = []
     try:
         reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
         if reader.pages:
             p1_txt = reader.pages[0].extract_text() or ""
+            def visitor(text, cm, tm, fontDict, fontSize):
+                if text.strip(): visitor_parts.append(text.strip())
+            reader.pages[0].extract_text(visitor_text=visitor)
     except Exception as e:
         print(f"Lỗi đọc PDF pypdf: {e}")
 
-    if p1_txt:
+    full_extracted = p1_txt + "\n" + " ".join(visitor_parts)
+
+    if full_extracted:
         # 1. Tìm số công văn / số đệ trình
         ref_patterns = [
             r'(?:Ref\.?\s*(?:No\.?)?|Letter\s*(?:No\.?)?|TR\.?\s*(?:No\.?)?|Transmittal\s*(?:No\.?)?|No\.?)\s*[:\s]*([A-Za-z0-9_-]*QT1[A-Za-z0-9_-]+)',
@@ -191,27 +181,27 @@ def parse_cover_pdf_bytes(pdf_bytes, filename=""):
             r'(QT1-[A-Za-z0-9_-]+)'
         ]
         for pat in ref_patterns:
-            tr_m = re.search(pat, p1_txt, re.IGNORECASE)
+            tr_m = re.search(pat, full_extracted, re.IGNORECASE)
             if tr_m:
                 found_ref = tr_m.group(1).strip()
                 if len(found_ref) >= 8:
                     metadata['tr_no'] = found_ref
                     break
         
-        # 2. Tìm ngày tháng bằng hàm quét chuyên dụng
-        extracted_date = robust_extract_date(p1_txt)
+        # 2. Tìm ngày tháng bằng hàm chuẩn hóa mới
+        extracted_date = extract_letter_official_date(full_extracted)
         if extracted_date:
             metadata['date_str'] = extracted_date
 
         # 3. Tìm chủ đề (Subject)
-        subj_m = re.search(r'(?:SUBJECT|Subject|Sub|V/v)\s*[:\s]+([^\n\r]+)', p1_txt)
+        subj_m = re.search(r'(?:SUBJECT|Subject|Sub|V/v)\s*[:\s]+([^\n\r]+)', full_extracted)
         if subj_m:
             raw_subj = subj_m.group(1).strip()
-            raw_subj = re.split(r'(?:Document/Drawing|Attachment|Attn:|Dear)', raw_subj, flags=re.IGNORECASE)[0].strip()
+            raw_subj = re.split(r'(?:Document/Drawing|Attachment|Attn:|Dear|Reference)', raw_subj, flags=re.IGNORECASE)[0].strip()
             if len(raw_subj) >= 5:
                 metadata['subject'] = raw_subj
 
-    # Ưu tiên dữ liệu từ tên file nếu đọc trong PDF bị thiếu
+    # Ưu tiên dữ liệu chuẩn xác từ tên file nếu đọc trong PDF bị rỗng
     if (not metadata['tr_no'] or metadata['tr_no'] == 'QT1-Letter') and fn_doc_no:
         metadata['tr_no'] = fn_doc_no
     if (not metadata['subject'] or metadata['subject'] == 'Official Transmittal') and fn_subject:
@@ -471,7 +461,7 @@ async def export_zip_full(
                                     src_c = new_ws.cell(row=r, column=prev_com_col)
                                     tgt_c = new_ws.cell(row=r, column=new_com_col)
                                     if src_c.has_style:
-                                        tgt_c.font, tgt_c.border, tgt_c.alignment = copy(src_c.font), copy(src_c.border), copy(src_c.fill), copy(src_c.alignment)
+                                        tgt_c.font, tgt_c.border, tgt_c.alignment = copy(src_c.font), copy(src_c.border), copy(src_c.alignment)
 
                                 is_group = "general comment" in v_prev_c.lower() or "detailed comment" in v_prev_c.lower()
                                 if is_group:
