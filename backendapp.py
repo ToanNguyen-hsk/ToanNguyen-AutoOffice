@@ -48,7 +48,6 @@ def extract_letter_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
     except Exception as e:
         print(f"pypdf reader error: {e}")
         
-    # Thử giải mã thô các stream nếu pypdf đọc thiếu
     try:
         for m in re.finditer(rb'stream[\r\n]+([\s\S]*?)[\r\n]+endstream', pdf_bytes):
             try:
@@ -77,9 +76,8 @@ def extract_letter_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
     if not tr_no:
         tr_no = "QT1-Letter"
 
-    # 3. Bóc tách Ngày thư EPC (Tuyệt đối không lấy ngày hiện tại)
+    # 3. Bóc tách Ngày thư EPC (Ưu tiên bắt chính xác ô Date)
     date_str = ""
-    # Dạng 1: Date: October 19, 2026 hoặc Date : October 19, 2026
     m_d1 = re.search(r'\bDate\b\s*[:\s-]*\s*(' + month_pat + r')\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(202\d)', full_text, re.IGNORECASE)
     if m_d1:
         mon = month_map[m_d1.group(1).lower()]
@@ -87,7 +85,6 @@ def extract_letter_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
         yr = m_d1.group(3)
         date_str = f"{day:02d}/{mon:02d}/{yr}"
 
-    # Dạng 2: Date: 19 October 2026
     if not date_str:
         m_d2 = re.search(r'\bDate\b\s*[:\s-]*\s*(\d{1,2})(?:st|nd|rd|th)?\s+(' + month_pat + r'),?\s+(202\d)', full_text, re.IGNORECASE)
         if m_d2:
@@ -96,13 +93,11 @@ def extract_letter_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
             yr = m_d2.group(3)
             date_str = f"{day:02d}/{mon:02d}/{yr}"
 
-    # Dạng 3: Date: DD/MM/YYYY
     if not date_str:
         m_d3 = re.search(r'\bDate\b\s*[:\s-]*\s*(\d{1,2})[\/.-](\d{1,2})[\/.-](202\d)', full_text, re.IGNORECASE)
         if m_d3:
             date_str = f"{int(m_d3.group(1)):02d}/{int(m_d3.group(2)):02d}/{m_d3.group(3)}"
 
-    # Dạng 4: Quét xung quanh Ref No (loại trừ dated)
     if not date_str and tr_no:
         idx = full_text.find(tr_no)
         if idx != -1:
@@ -133,7 +128,7 @@ def extract_letter_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
     if not subject:
         subject = "Official Transmittal"
 
-    # 5. Bóc tách danh mục tài liệu (Drawing list nếu có bảng)
+    # 5. Bóc tách danh mục bản vẽ
     docs = {}
     for line in full_text.splitlines():
         m_doc = re.search(r'(QT1-[0-9L]-[A-Z]+-[A-Z0-9]+-\d{2}-\d{5})', line)
@@ -194,29 +189,51 @@ def find_template(prefix):
 
 def replace_value_after_keyword(paragraph, keyword, new_text):
     if keyword in paragraph.text:
-        if not paragraph.runs: return False
+        if not paragraph.runs:
+            paragraph.text = f"{keyword} {new_text}"
+            return True
         kw_font = paragraph.runs[0].font
-        kw_name, kw_size, kw_bold, kw_italic = kw_font.name, kw_font.size, kw_font.bold, kw_italic
+        kw_name = kw_font.name
+        kw_size = kw_font.size
+        kw_bold = kw_font.bold
+        kw_italic = kw_font.italic
+        
         val_font = paragraph.runs[-1].font
-        val_name, val_size, val_bold, val_italic = val_font.name, val_font.size, val_font.bold, val_font.italic
+        val_name = val_font.name
+        val_size = val_font.size
+        val_bold = val_font.bold
+        val_italic = val_font.italic
         
         paragraph.clear()
         r1 = paragraph.add_run(keyword)
-        r1.font.name, r1.font.size, r1.font.bold, r1.font.italic = kw_name, kw_size, kw_bold, kw_italic
+        r1.font.name = kw_name
+        r1.font.size = kw_size
+        r1.font.bold = kw_bold
+        r1.font.italic = kw_italic
+
         r2 = paragraph.add_run(" " + new_text)
-        r2.font.name, r2.font.size, r2.font.bold, r2.font.italic = val_name, val_size, val_bold, val_italic
+        r2.font.name = val_name
+        r2.font.size = val_size
+        r2.font.bold = val_bold
+        r2.font.italic = val_italic
         return True
     return False
 
 def update_date_paragraph(paragraph, new_date_str):
     spaces = "                                "
     val_font = paragraph.runs[-1].font
-    val_name, val_size, val_bold, val_italic = val_font.name, val_font.size, val_font.bold, val_font.italic
+    val_name = val_font.name
+    val_size = val_font.size
+    val_bold = val_font.bold
+    val_italic = val_font.italic
     
     paragraph.clear()
     r1 = paragraph.add_run(spaces)
     r2 = paragraph.add_run(new_date_str)
-    r2.font.name, r2.font.size, r2.font.bold, r2.font.italic = val_name, val_size, val_bold, val_italic
+    r2.font.name = val_name
+    r2.font.size = val_size
+    r2.font.bold = val_bold
+    r2.font.italic = val_italic
 
 def sync_footer_content(doc, qti_no, subject):
     new_text = f"{qti_no} {subject}"
@@ -270,7 +287,7 @@ async def export_zip_full(
         current_date_str = now.strftime("%d %b %Y")
         current_date_en = now.strftime("%B %d, %Y")
         
-        # Bóc tách metadata từ file Cover (Không dùng datetime.now() cho date_str)
+        # Bóc tách metadata từ file Cover
         cover_data = {
             'tr_no': 'QT1-Document',
             'date_str': '19/10/2026',
@@ -286,7 +303,6 @@ async def export_zip_full(
                 cover_data = parse_cover_excel_bytes(cover_bytes, cover_file.filename)
             del cover_bytes
 
-        # Ưu tiên nếu có gõ ngày trực tiếp từ giao diện web
         if custom_date and custom_date.strip():
             cover_data['date_str'] = custom_date.strip()
 
