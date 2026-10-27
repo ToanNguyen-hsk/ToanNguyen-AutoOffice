@@ -29,7 +29,7 @@ def clean_safe_filename(name: str) -> str:
     cleaned = re.sub(r'[\\/*?:"<>|]', '-', name).strip()
     return cleaned[:130] if len(cleaned) > 130 else cleaned
 
-def extract_letter_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
+def extract_cover_date(text: str) -> str:
     month_map = {
         'jan': 1, 'january': 1, 'feb': 2, 'february': 2, 'mar': 3, 'march': 3,
         'apr': 4, 'april': 4, 'may': 5, 'jun': 6, 'june': 6, 'jul': 7, 'july': 7,
@@ -38,7 +38,34 @@ def extract_letter_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
     }
     month_pat = r'(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)'
     
-    # 1. Trích xuất text từ toàn bộ PDF
+    # 1. Month Day, Year (vd: Date: October 19, 2026)
+    m1 = re.search(r'\bDate\b\s*[:\s-]*\s*(' + month_pat + r')\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(202\d)', text, re.IGNORECASE)
+    if m1:
+        mon = month_map[m1.group(1).lower()]
+        day = int(m1.group(2))
+        yr = m1.group(3)
+        return f"{day:02d}/{mon:02d}/{yr}"
+
+    # 2. Day Month Year (vd: Date: 19 October 2026)
+    m2 = re.search(r'\bDate\b\s*[:\s-]*\s*(\d{1,2})(?:st|nd|rd|th)?\s+(' + month_pat + r'),?\s+(202\d)', text, re.IGNORECASE)
+    if m2:
+        day = int(m2.group(1))
+        mon = month_map[m2.group(2).lower()]
+        yr = m2.group(3)
+        return f"{day:02d}/{mon:02d}/{yr}"
+
+    # 3. Transmittal box dạng số có dấu cách hoặc gạch: 10 10 2026 hoặc 10/10/2026 hoặc 10-10-2026
+    m3 = re.search(r'\bDate\b\s*[:\s-]*\s*(\d{1,2})[\s\/.—-]+(\d{1,2})[\s\/.—-]+(202\d)', text, re.IGNORECASE)
+    if m3:
+        d_val = int(m3.group(1))
+        m_val = int(m3.group(2))
+        y_val = m3.group(3)
+        if 1 <= m_val <= 12 and 1 <= d_val <= 31:
+            return f"{d_val:02d}/{m_val:02d}/{y_val}"
+
+    return ""
+
+def extract_letter_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
     all_texts = []
     try:
         reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
@@ -60,13 +87,13 @@ def extract_letter_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
         
     full_text = "\n".join(all_texts)
 
-    # 2. Bóc tách Ref No
+    # 1. Bóc tách Tr_no
     tr_no = ""
     m_fn = re.search(r'(QT1-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+)', filename)
     if m_fn:
         tr_no = m_fn.group(1).strip()
     if not tr_no:
-        m_ref = re.search(r'Ref\.?\s*[:\s]*([A-Za-z0-9_-]*QT1[A-Za-z0-9_-]+)', full_text, re.IGNORECASE)
+        m_ref = re.search(r'(?:TR\.?\s*No\.?|Ref\.?)\s*[:\s]*([A-Za-z0-9_-]*QT1[A-Za-z0-9_-]+)', full_text, re.IGNORECASE)
         if m_ref and "EVNPMB2" not in m_ref.group(1):
             tr_no = m_ref.group(1).strip()
     if not tr_no:
@@ -74,75 +101,61 @@ def extract_letter_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
         if m_ref2 and "EVNPMB2" not in m_ref2.group(1):
             tr_no = m_ref2.group(1).strip()
     if not tr_no:
-        tr_no = "QT1-Letter"
+        tr_no = "QT1-Transmittal"
 
-    # 3. Bóc tách Ngày thư EPC (Ưu tiên bắt chính xác ô Date)
-    date_str = ""
-    m_d1 = re.search(r'\bDate\b\s*[:\s-]*\s*(' + month_pat + r')\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(202\d)', full_text, re.IGNORECASE)
-    if m_d1:
-        mon = month_map[m_d1.group(1).lower()]
-        day = int(m_d1.group(2))
-        yr = m_d1.group(3)
-        date_str = f"{day:02d}/{mon:02d}/{yr}"
+    # 2. Bóc tách Date
+    date_str = extract_cover_date(full_text)
 
-    if not date_str:
-        m_d2 = re.search(r'\bDate\b\s*[:\s-]*\s*(\d{1,2})(?:st|nd|rd|th)?\s+(' + month_pat + r'),?\s+(202\d)', full_text, re.IGNORECASE)
-        if m_d2:
-            day = int(m_d2.group(1))
-            mon = month_map[m_d2.group(2).lower()]
-            yr = m_d2.group(3)
-            date_str = f"{day:02d}/{mon:02d}/{yr}"
-
-    if not date_str:
-        m_d3 = re.search(r'\bDate\b\s*[:\s-]*\s*(\d{1,2})[\/.-](\d{1,2})[\/.-](202\d)', full_text, re.IGNORECASE)
-        if m_d3:
-            date_str = f"{int(m_d3.group(1)):02d}/{int(m_d3.group(2)):02d}/{m_d3.group(3)}"
-
-    if not date_str and tr_no:
-        idx = full_text.find(tr_no)
-        if idx != -1:
-            snippet = full_text[max(0, idx - 200): min(len(full_text), idx + 200)]
-            snippet = re.sub(r'\bdated\s+[^\n\r,]+', '', snippet, flags=re.IGNORECASE)
-            m_snip = re.search(r'\b(' + month_pat + r')\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(202\d)', snippet, re.IGNORECASE)
-            if m_snip:
-                mon = month_map[m_snip.group(1).lower()]
-                day = int(m_snip.group(2))
-                yr = m_snip.group(3)
-                date_str = f"{day:02d}/{mon:02d}/{yr}"
-
-    # 4. Bóc tách Subject
+    # 3. Bóc tách Subject
     subject = ""
-    if tr_no and filename:
+    m_sub = re.search(r'(?:SUBJECT|Subject)\s*[:\s]+([^\n\r]+)', full_text, re.IGNORECASE)
+    if m_sub:
+        raw_sub = m_sub.group(1).strip()
+        raw_sub = re.split(r'(?:Reference|Dear|Attn|Attachment|Document/Drawing|Sheet:)', raw_sub, flags=re.IGNORECASE)[0].strip()
+        # Loại bỏ các từ rác do format bảng nếu có
+        raw_sub = re.sub(r'Sheet:\s*.*$', '', raw_sub, flags=re.IGNORECASE).strip()
+        subject = raw_sub
+
+    if not subject and tr_no and filename:
         parts = os.path.splitext(filename)[0].split(tr_no, 1)
         if len(parts) > 1 and parts[1].strip('_- '):
             subject = parts[1].strip('_- ')
             subject = re.sub(r'(_|-)?Cover$', '', subject, flags=re.IGNORECASE).strip()
 
     if not subject:
-        m_sub = re.search(r'Subject\s*[:\s]+([^\n\r]+)', full_text, re.IGNORECASE)
-        if m_sub:
-            raw_sub = m_sub.group(1).strip()
-            raw_sub = re.split(r'(?:Reference|Dear|Attn|Attachment)', raw_sub, flags=re.IGNORECASE)[0].strip()
-            subject = raw_sub
-
-    if not subject:
         subject = "Official Transmittal"
 
-    # 5. Bóc tách danh mục bản vẽ
+    # 4. Bóc tách danh mục tài liệu (Drawing/Doc Table)
     docs = {}
     for line in full_text.splitlines():
-        m_doc = re.search(r'(QT1-[0-9L]-[A-Z]+-[A-Z0-9]+-\d{2}-\d{5})', line)
-        if m_doc:
-            doc_code = m_doc.group(1)
+        m_doc = re.search(r'(QT1-[0-9L]-[A-Za-z0-9_-]+)', line)
+        if m_doc and "EVNPMB2" not in m_doc.group(1) and "QT1-HDH" not in m_doc.group(1):
+            doc_code = m_doc.group(1).strip()
+            rev = "1"
+            title = ""
+            after = line[m_doc.end():].strip()
+            parts = [p.strip() for p in re.split(r'[\t|]+', after) if p.strip()]
+            if parts:
+                if len(parts[0]) <= 3 and parts[0].isalnum():
+                    rev = parts[0]
+                    if len(parts) > 1: title = parts[1]
+                else:
+                    title = parts[0]
+            else:
+                title = subject
+
+            title = re.sub(r'\s+(IFA|APD|IFI|RI|- END -).*$', '', title).strip()
+            if not title: title = subject
+
             docs[doc_code] = {
                 'doc_no': doc_code,
-                'rev': '1',
-                'title': line.replace(doc_code, '').strip()
+                'rev': rev,
+                'title': title
             }
 
     return {
         'tr_no': tr_no,
-        'date_str': date_str if date_str else "19/10/2026",
+        'date_str': date_str if date_str else datetime.now().strftime("%d/%m/%Y"),
         'subject': subject,
         'docs': docs
     }
@@ -156,7 +169,7 @@ def parse_cover_excel_bytes(excel_bytes, filename=""):
     ws = wb.active
     metadata = {
         'tr_no': fn_doc_no if fn_doc_no else 'QT1-Document',
-        'date_str': '19/10/2026',
+        'date_str': datetime.now().strftime("%d/%m/%Y"),
         'subject': 'Official Transmittal',
         'docs': {}
     }
@@ -287,10 +300,9 @@ async def export_zip_full(
         current_date_str = now.strftime("%d %b %Y")
         current_date_en = now.strftime("%B %d, %Y")
         
-        # Bóc tách metadata từ file Cover
         cover_data = {
             'tr_no': 'QT1-Document',
-            'date_str': '19/10/2026',
+            'date_str': now.strftime("%d/%m/%Y"),
             'subject': 'Official Transmittal',
             'docs': {}
         }
@@ -324,6 +336,9 @@ async def export_zip_full(
                     try:
                         content = await file.read()
 
+                        # =========================================================================
+                        # CHẾ ĐỘ: AUTO BUMP (TỰ ĐỘNG TẠO ROUND MỚI R+1)
+                        # =========================================================================
                         if mode == "auto_bump":
                             wb = openpyxl.load_workbook(io.BytesIO(content))
                             max_r = 1
@@ -347,36 +362,32 @@ async def export_zip_full(
                             wb._sheets.remove(new_ws)
                             wb._sheets.insert(target_idx + 1, new_ws)
                             
+                            # Tìm com_col
+                            prev_com_col, prev_rep_col = None, None
+                            for c in range(1, new_ws.max_column + 1):
+                                val_h = str(new_ws.cell(row=11, column=c).value or "").upper()
+                                if f"ROUND {max_r} COMMENTS" in val_h: prev_com_col = c
+                                elif f"ROUND {max_r} REPLIES" in val_h: prev_rep_col = c
+
                             detected_doc_code = ""
                             m_fdoc = re.search(r'(QT1-[A-Za-z0-9_-]+)', file.filename)
                             if m_fdoc: detected_doc_code = m_fdoc.group(1)
 
-                            detected_title = ""
-                            for c in range(1, source_ws.max_column + 1):
-                                r4_val = str(source_ws.cell(row=4, column=c).value or "")
+                            if prev_com_col:
+                                r4_val = str(source_ws.cell(row=4, column=prev_com_col).value or "")
                                 m_c = re.search(r'(QT1-[A-Za-z0-9_-]+)', r4_val)
                                 if m_c: detected_doc_code = m_c.group(1)
-                                
-                                r5_val = str(source_ws.cell(row=5, column=c).value or "").strip()
-                                if r5_val and not detected_title:
-                                    detected_title = re.sub(r'_(IFA|APD|IFI|RI|HDEC|Reply).*$', '', r5_val, flags=re.IGNORECASE).strip()
 
                             cover_info = cover_data['docs'].get(detected_doc_code, {})
                             final_doc_no = cover_info.get('doc_no', detected_doc_code if detected_doc_code else "QT1-Document")
                             final_rev = cover_info.get('rev', '1')
-                            final_title = cover_info.get('title', detected_title if detected_title else "P&I Diagram")
+                            final_title = cover_info.get('title', cover_data['subject'])
 
                             for c in range(1, 10):
                                 v = str(new_ws.cell(row=1, column=c).value or "")
                                 if re.search(r'-\s*R\d+', v, re.IGNORECASE) or (c == 5 and v):
                                     new_ws.cell(row=1, column=c).value = re.sub(r'R\d+', f'R{new_r_num}', v, flags=re.IGNORECASE)
                                     break
-
-                            prev_com_col, prev_rep_col = None, None
-                            for c in range(1, new_ws.max_column + 1):
-                                val_h = str(new_ws.cell(row=11, column=c).value or "").upper()
-                                if f"ROUND {max_r} COMMENTS" in val_h: prev_com_col = c
-                                elif f"ROUND {max_r} REPLIES" in val_h: prev_rep_col = c
 
                             new_com_col = (prev_rep_col + 1) if prev_rep_col else (new_ws.max_column + 1)
                             new_rep_col = new_com_col + 2
@@ -459,6 +470,9 @@ async def export_zip_full(
                                 'assigned_car_name': new_excel_name
                             })
 
+                        # =========================================================================
+                        # CHẾ ĐỘ: NUMBER FILLED CARS (KỸ SƯ ĐÃ ĐIỀN DỮ LIỆU - CHỈ CẤP SỐ & ĐỌC STATUS)
+                        # =========================================================================
                         elif mode == "number_filled_cars":
                             cur_num = start_num + file_idx
                             car_base = f"{cur_num:04d} CaRs" if cur_num < 10000 else f"{cur_num} CaRs"
@@ -474,64 +488,90 @@ async def export_zip_full(
 
                             car_label = f"{car_base} R{max_r}"
 
-                            detected_doc_code = ""
-                            m_fdoc = re.search(r'(QT1-[A-Za-z0-9_-]+)', file.filename)
-                            if m_fdoc: detected_doc_code = m_fdoc.group(1)
-
-                            detected_title = ""
-                            for c in range(1, target_ws.max_column + 1):
-                                r4_val = str(target_ws.cell(row=4, column=c).value or "")
-                                m_c = re.search(r'(QT1-[A-Za-z0-9_-]+)', r4_val)
-                                if m_c: detected_doc_code = m_c.group(1)
-                                r5_val = str(target_ws.cell(row=5, column=c).value or "").strip()
-                                if r5_val and not detected_title:
-                                    detected_title = re.sub(r'_(IFA|APD|IFI|RI|HDEC|Reply).*$', '', r5_val, flags=re.IGNORECASE).strip()
-
-                            doc_keys = list(cover_data['docs'].keys())
-                            if (not detected_doc_code or detected_doc_code not in cover_data['docs']) and file_idx < len(doc_keys):
-                                cover_info = cover_data['docs'][doc_keys[file_idx]]
-                                final_doc_no = cover_info['doc_no']
-                                final_rev = cover_info['rev']
-                                final_title = cover_info['title']
-                            else:
-                                cover_info = cover_data['docs'].get(detected_doc_code, {})
-                                final_doc_no = cover_info.get('doc_no', detected_doc_code if detected_doc_code else f"QT1-Doc-{cur_num}")
-                                final_rev = cover_info.get('rev', '1')
-                                final_title = cover_info.get('title', detected_title if detected_title else "Document")
-
-                            for c in range(1, 10):
-                                v = str(target_ws.cell(row=1, column=c).value or "")
-                                if re.search(r'CaRs?', v, re.IGNORECASE) or (c == 5 and v):
-                                    target_ws.cell(row=1, column=c).value = f"{car_base} - R{max_r}"
-                                    break
-
+                            # Tìm đúng cột ý kiến com_col
                             com_col = None
                             for c in range(1, target_ws.max_column + 1):
                                 val_h = str(target_ws.cell(row=11, column=c).value or "").upper()
                                 if f"ROUND {max_r} COMMENTS" in val_h or f"ROUND {max_r} COMMENT" in val_h:
                                     com_col = c
                                     break
+                            if not com_col: com_col = 7
 
-                            selected_status = car_metadata.get(file.filename, None)
-                            if not selected_status:
-                                selected_status = "APP"
+                            # BƯỚC 1: ĐỌC CHÍNH XÁC STATUS TỪ FILE CARS CỦA KỸ SƯ
+                            detected_status_raw = "APPROVED (APP)"
+                            found_rfc = False
+                            found_awc = False
+                            found_rj = False
+                            for r in range(11, 16):
+                                v_st = str(target_ws.cell(row=r, column=com_col).value or "").strip().upper()
+                                if "RETURN FOR CORRECTIONS" in v_st or "(RFC)" in v_st or v_st == "RFC":
+                                    found_rfc = True
+                                elif "APPROVED WITH COMMENTS" in v_st or "(AWC)" in v_st or v_st == "AWC":
+                                    found_awc = True
+                                elif "REJECTED" in v_st or "(RJ)" in v_st or v_st == "RJ":
+                                    found_rj = True
 
-                            status_full_text = "APPROVED (APP)" if selected_status == "APP" else "RETURN FOR CORRECTIONS (RFC)"
-                            if selected_status == "AWC": status_full_text = "APPROVED WITH COMMENTS (AWC)"
-                            elif selected_status == "RJ": status_full_text = "REJECTED (RJ)"
+                            if found_rfc:
+                                detected_status_raw = "RETURN FOR CORRECTIONS (RFC)"
+                            elif found_awc:
+                                detected_status_raw = "APPROVED WITH COMMENTS (AWC)"
+                            elif found_rj:
+                                detected_status_raw = "REJECTED (RJ)"
+                            else:
+                                detected_status_raw = "APPROVED (APP)"
 
-                            if com_col:
-                                target_ws.cell(row=2, column=com_col).value = "EVNPMB2"
-                                target_ws.cell(row=3, column=com_col).value = cover_data['tr_no']
-                                target_ws.cell(row=4, column=com_col).value = f"{final_doc_no} rev.{final_rev}"
-                                target_ws.cell(row=5, column=com_col).value = final_title
-                                target_ws.cell(row=12, column=com_col).value = f"STATUS AFTER ROUND {max_r} COMMENTS:"
-                                target_ws.cell(row=13, column=com_col).value = status_full_text
-                                
-                                red_bold = Font(name="Arial", size=10, bold=True, color="FFFF0000")
-                                target_ws.cell(row=12, column=com_col).font = red_bold
-                                target_ws.cell(row=13, column=com_col).font = red_bold
+                            # BƯỚC 2: BÓC TÁCH MÃ DOC, REV, TITLE (TRÁNH BẮT NHẦM CỘT A CHỮ iv)
+                            detected_doc_code = ""
+                            m_fdoc = re.search(r'(QT1-[A-Za-z0-9_-]+)', file.filename)
+                            if m_fdoc: detected_doc_code = m_fdoc.group(1)
 
+                            r4_val = str(target_ws.cell(row=4, column=com_col).value or "")
+                            m_c = re.search(r'(QT1-[A-Za-z0-9_-]+)', r4_val)
+                            if m_c: detected_doc_code = m_c.group(1)
+
+                            # Khớp thông tin với Thư Cover
+                            doc_keys = list(cover_data['docs'].keys())
+                            if detected_doc_code in cover_data['docs']:
+                                cover_info = cover_data['docs'][detected_doc_code]
+                            elif doc_keys and file_idx < len(doc_keys):
+                                cover_info = cover_data['docs'][doc_keys[file_idx]]
+                            elif doc_keys:
+                                cover_info = cover_data['docs'][doc_keys[0]]
+                            else:
+                                cover_info = {}
+
+                            final_doc_no = cover_info.get('doc_no', detected_doc_code if detected_doc_code else "QT1-Document")
+                            final_rev = cover_info.get('rev', '1')
+                            
+                            # Lấy title chuẩn (Tránh chữ "iv" của cột A)
+                            r5_val = str(target_ws.cell(row=5, column=com_col).value or "").strip()
+                            if r5_val.lower() in ['iv', 'v', 'title of document', '']:
+                                r5_val = ""
+
+                            if cover_info.get('title'):
+                                final_title = cover_info['title']
+                            elif r5_val:
+                                final_title = r5_val
+                            else:
+                                # Lấy title từ tên file upload của kỹ sư (loại bỏ Xxxx CaRs R1)
+                                clean_t = re.sub(r'^(?:Xxxx|\d+)\s*CaRs?\s*R\d+\s*', '', file.filename, flags=re.IGNORECASE)
+                                clean_t = os.path.splitext(clean_t)[0].strip()
+                                final_title = clean_t if clean_t else cover_data['subject']
+
+                            # BƯỚC 3: CẬP NHẬT HEADER CHUẨN VÀO FILE EXCEL
+                            # Cập nhật số CaR vào dòng 1: "9904 CaRs - R1"
+                            for c in range(1, 10):
+                                v = str(target_ws.cell(row=1, column=c).value or "")
+                                if re.search(r'CaRs?', v, re.IGNORECASE) or (c == 5 and v):
+                                    target_ws.cell(row=1, column=c).value = f"{car_base} - R{max_r}"
+                                    break
+
+                            target_ws.cell(row=2, column=com_col).value = "EVNPMB2"
+                            target_ws.cell(row=3, column=com_col).value = cover_data['tr_no']
+                            target_ws.cell(row=4, column=com_col).value = f"{final_doc_no} rev.{final_rev}"
+                            target_ws.cell(row=5, column=com_col).value = final_title
+
+                            # BẢO TỒN NGUYÊN VẸN CÁC DÒNG NHẬN XÉT CỦA KỸ SƯ TỪ DÒNG 14 TRỞ ĐI
                             safe_title_for_name = clean_safe_filename(final_title)
                             new_excel_name = f"{car_base} R{max_r} {current_date_str} {final_doc_no} {safe_title_for_name} rev.{final_rev}.xlsx"
 
@@ -544,11 +584,14 @@ async def export_zip_full(
                                 'doc_no': final_doc_no,
                                 'rev': final_rev,
                                 'title': final_title,
-                                'status': status_full_text,
+                                'status': detected_status_raw,
                                 'car_label': car_label,
                                 'assigned_car_name': new_excel_name
                             })
 
+                        # =========================================================================
+                        # CHẾ ĐỘ: NEW CARS (TẠO CARS TỪ MẪU TRẮNG)
+                        # =========================================================================
                         elif mode == "new_cars":
                             cur_num = start_num + file_idx
                             car_base = f"{cur_num:04d} CaRs" if cur_num < 10000 else f"{cur_num} CaRs"
@@ -563,51 +606,32 @@ async def export_zip_full(
                                     break
                             target_ws.title = "ROUND 1 CaRs"
 
+                            com_col = 8
+                            rep_col = com_col + 2
+
                             detected_doc_code = ""
                             m_fdoc = re.search(r'(QT1-[A-Za-z0-9_-]+)', file.filename)
                             if m_fdoc: detected_doc_code = m_fdoc.group(1)
 
-                            detected_title = ""
-                            for c in range(1, target_ws.max_column + 1):
-                                r4_val = str(target_ws.cell(row=4, column=c).value or "")
-                                m_c = re.search(r'(QT1-[A-Za-z0-9_-]+)', r4_val)
-                                if m_c: detected_doc_code = m_c.group(1)
-                                r5_val = str(target_ws.cell(row=5, column=c).value or "").strip()
-                                if r5_val and not detected_title:
-                                    detected_title = re.sub(r'_(IFA|APD|IFI|RI|HDEC|Reply).*$', '', r5_val, flags=re.IGNORECASE).strip()
-
                             doc_keys = list(cover_data['docs'].keys())
-                            if (not detected_doc_code or detected_doc_code not in cover_data['docs']) and file_idx < len(doc_keys):
+                            if detected_doc_code in cover_data['docs']:
+                                cover_info = cover_data['docs'][detected_doc_code]
+                            elif doc_keys and file_idx < len(doc_keys):
                                 cover_info = cover_data['docs'][doc_keys[file_idx]]
-                                final_doc_no = cover_info['doc_no']
-                                final_rev = cover_info['rev']
-                                final_title = cover_info['title']
+                            elif doc_keys:
+                                cover_info = cover_data['docs'][doc_keys[0]]
                             else:
-                                cover_info = cover_data['docs'].get(detected_doc_code, {})
-                                final_doc_no = cover_info.get('doc_no', detected_doc_code if detected_doc_code else f"QT1-Doc-{cur_num}")
-                                final_rev = cover_info.get('rev', '1')
-                                final_title = cover_info.get('title', detected_title if detected_title else "Document")
+                                cover_info = {}
 
-                            row1_done = False
+                            final_doc_no = cover_info.get('doc_no', detected_doc_code if detected_doc_code else f"QT1-Doc-{cur_num}")
+                            final_rev = cover_info.get('rev', '1')
+                            final_title = cover_info.get('title', cover_data['subject'])
+
                             for c in range(1, 10):
                                 v = str(target_ws.cell(row=1, column=c).value or "")
                                 if re.search(r'CaRs?', v, re.IGNORECASE) or (c == 5 and v):
                                     target_ws.cell(row=1, column=c).value = f"{car_base} - R1"
-                                    row1_done = True
                                     break
-                            if not row1_done:
-                                target_ws.cell(row=1, column=5).value = f"{car_base} - R1"
-
-                            com_col, rep_col = None, None
-                            for c in range(1, target_ws.max_column + 1):
-                                val_h = str(target_ws.cell(row=11, column=c).value or "").upper()
-                                if "ROUND 1 COMMENTS" in val_h or "ROUND 1 COMMENT" in val_h:
-                                    com_col = c
-                                elif "ROUND 1 REPLIES" in val_h or "ROUND 1 REPLY" in val_h:
-                                    rep_col = c
-
-                            if not com_col: com_col = 8
-                            if not rep_col: rep_col = com_col + 2
 
                             target_ws.cell(row=2, column=com_col).value = "EVNPMB2"
                             target_ws.cell(row=3, column=com_col).value = cover_data['tr_no']
@@ -656,6 +680,9 @@ async def export_zip_full(
                                 'assigned_car_name': new_excel_name
                             })
 
+                        # =========================================================================
+                        # CHẾ ĐỘ: PRE PREPARED (ĐÃ CÓ SẴN CAR)
+                        # =========================================================================
                         else:
                             wb_ro = openpyxl.load_workbook(io.BytesIO(content), read_only=True)
                             max_r = 1
@@ -674,20 +701,10 @@ async def export_zip_full(
                             m_fdoc = re.search(r'(QT1-[A-Za-z0-9_-]+)', file.filename)
                             if m_fdoc: detected_doc_code = m_fdoc.group(1)
 
-                            detected_title = ""
-                            for row in source_ws.iter_rows(min_row=4, max_row=5, values_only=True):
-                                for cell_val in row:
-                                    val_str = str(cell_val or "").strip()
-                                    if not detected_doc_code:
-                                        m_c = re.search(r'(QT1-[A-Za-z0-9_-]+)', val_str)
-                                        if m_c: detected_doc_code = m_c.group(1)
-                                    if val_str and not detected_title:
-                                        detected_title = re.sub(r'_(IFA|APD|IFI|RI|HDEC|Reply).*$', '', val_str, flags=re.IGNORECASE).strip()
-
                             cover_info = cover_data['docs'].get(detected_doc_code, {})
                             final_doc_no = cover_info.get('doc_no', detected_doc_code if detected_doc_code else "QT1-Document")
                             final_rev = cover_info.get('rev', '1')
-                            final_title = cover_info.get('title', detected_title if detected_title else "Document")
+                            final_title = cover_info.get('title', cover_data['subject'])
                             
                             status_full_text = "APPROVED (APP)"
                             for c in range(1, source_ws.max_column + 1):
@@ -718,6 +735,9 @@ async def export_zip_full(
                         print(f"Lỗi xử lý file {file.filename}: {fe}")
                         traceback.print_exc()
 
+            # =========================================================================
+            # CHẾ ĐỘ: TRẢ LỜI THƯ, KHÔNG CÓ CAR
+            # =========================================================================
             elif mode == "no_car_letter":
                 if cover_data['docs']:
                     for doc_k, d_info in cover_data['docs'].items():
@@ -741,6 +761,9 @@ async def export_zip_full(
 
             safe_subj_name = clean_safe_filename(cover_data['subject'])
 
+            # =========================================================================
+            # XUẤT TỜ TRÌNH TIẾNG VIỆT
+            # =========================================================================
             doc_vi = Document(vi_template_path)
             for tbl in doc_vi.tables:
                 for row in tbl.rows:
@@ -765,6 +788,9 @@ async def export_zip_full(
             zip_file.writestr(f"TVÐ1-NÐNLM {safe_subj_name}.docx", vi_io.getvalue())
             del vi_io, doc_vi
 
+            # =========================================================================
+            # XUẤT THƯ TIẾNG ANH
+            # =========================================================================
             doc_en = Document(en_template_path)
             doc_type_en = "Letter" if "-L-" in cover_data['tr_no'].upper() else "Transmittal"
 
