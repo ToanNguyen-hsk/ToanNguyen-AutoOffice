@@ -8,7 +8,7 @@ from copy import copy
 from docx import Document
 from docx.shared import Pt, Inches, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-import re, io, zipfile, traceback, os, base64, gc, tempfile, json, zlib
+import re, io, zipfile, traceback, os, base64, gc, tempfile, json
 from datetime import datetime
 import pypdf
 
@@ -38,34 +38,52 @@ def extract_cover_date(text: str) -> str:
     }
     month_pat = r'(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)'
     
-    # 1. Month Day, Year (vd: Date: October 19, 2026)
-    m1 = re.search(r'\bDate\b\s*[:\s-]*\s*(' + month_pat + r')\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(202\d)', text, re.IGNORECASE)
-    if m1:
-        mon = month_map[m1.group(1).lower()]
-        day = int(m1.group(2))
-        yr = m1.group(3)
-        return f"{day:02d}/{mon:02d}/{yr}"
-
-    # 2. Day Month Year (vd: Date: 19 October 2026)
-    m2 = re.search(r'\bDate\b\s*[:\s-]*\s*(\d{1,2})(?:st|nd|rd|th)?\s+(' + month_pat + r'),?\s+(202\d)', text, re.IGNORECASE)
-    if m2:
-        day = int(m2.group(1))
-        mon = month_map[m2.group(2).lower()]
-        yr = m2.group(3)
-        return f"{day:02d}/{mon:02d}/{yr}"
-
-    # 3. Transmittal box dạng số có dấu cách hoặc gạch: 10 10 2026 hoặc 10/10/2026 hoặc 10-10-2026
-    m3 = re.search(r'\bDate\b\s*[:\s-]*\s*(\d{1,2})[\s\/.—-]+(\d{1,2})[\s\/.—-]+(202\d)', text, re.IGNORECASE)
-    if m3:
-        d_val = int(m3.group(1))
-        m_val = int(m3.group(2))
-        y_val = m3.group(3)
+    # 1. Định dạng ô Transmittal với các chữ số cách nhau: "1 0 1 0 2 0 2 6"
+    m_spaced = re.search(r'\bDate\b\s*[:\s-]*\s*(\d)\s*(\d)\s*(\d)\s*(\d)\s*(2)\s*(0)\s*(2)\s*(\d)', text, re.IGNORECASE)
+    if m_spaced:
+        g = m_spaced.groups()
+        d_val = int(g[0] + g[1])
+        m_val = int(g[2] + g[3])
+        y_val = g[4] + g[5] + g[6] + g[7]
         if 1 <= m_val <= 12 and 1 <= d_val <= 31:
             return f"{d_val:02d}/{m_val:02d}/{y_val}"
 
+    # 2. Định dạng Date: October 19, 2026 (kể cả khi bị ngắt dòng trong PDF)
+    m_date_pos = re.search(r'\bDate\b\s*:', text, re.IGNORECASE)
+    if m_date_pos:
+        snippet = text[m_date_pos.end(): m_date_pos.end() + 100]
+        collapsed = re.sub(r'\s+', ' ', snippet).strip()
+        
+        # Month Day, Year
+        m_m = re.search(r'\b(' + month_pat + r')\s*(\d{1,2})\s*,?\s*(202\s*\d)', collapsed, re.IGNORECASE)
+        if m_m:
+            mon_str = m_m.group(1).lower()
+            d_val = int(m_m.group(2))
+            y_val = re.sub(r'\s+', '', m_m.group(3))
+            if mon_str in month_map and 1 <= d_val <= 31:
+                return f"{d_val:02d}/{month_map[mon_str]:02d}/{y_val}"
+                
+        # Day Month Year
+        m_d = re.search(r'\b(\d{1,2})\s*(' + month_pat + r')\s*,?\s*(202\s*\d)', collapsed, re.IGNORECASE)
+        if m_d:
+            d_val = int(m_d.group(1))
+            mon_str = m_d.group(2).lower()
+            y_val = re.sub(r'\s+', '', m_d.group(3))
+            if mon_str in month_map and 1 <= d_val <= 31:
+                return f"{d_val:02d}/{month_map[mon_str]:02d}/{y_val}"
+
+        # DD/MM/YYYY
+        m_num = re.search(r'(\d{1,2})\s*[\/.-]\s*(\d{1,2})\s*[\/.-]\s*(202\s*\d)', collapsed)
+        if m_num:
+            d_val = int(m_num.group(1))
+            m_val = int(m_num.group(2))
+            y_val = re.sub(r'\s+', '', m_num.group(3))
+            if 1 <= m_val <= 12 and 1 <= d_val <= 31:
+                return f"{d_val:02d}/{m_val:02d}/{y_val}"
+
     return ""
 
-def extract_letter_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
+def extract_cover_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
     all_texts = []
     try:
         reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
@@ -75,19 +93,9 @@ def extract_letter_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
     except Exception as e:
         print(f"pypdf reader error: {e}")
         
-    try:
-        for m in re.finditer(rb'stream[\r\n]+([\s\S]*?)[\r\n]+endstream', pdf_bytes):
-            try:
-                decomp = zlib.decompress(m.group(1))
-                all_texts.append(decomp.decode('latin1', errors='ignore'))
-            except Exception:
-                pass
-    except Exception:
-        pass
-        
     full_text = "\n".join(all_texts)
 
-    # 1. Bóc tách Tr_no
+    # 1. Tr_no
     tr_no = ""
     m_fn = re.search(r'(QT1-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+)', filename)
     if m_fn:
@@ -97,23 +105,17 @@ def extract_letter_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
         if m_ref and "EVNPMB2" not in m_ref.group(1):
             tr_no = m_ref.group(1).strip()
     if not tr_no:
-        m_ref2 = re.search(r'(QT1-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+-\d+)', full_text)
-        if m_ref2 and "EVNPMB2" not in m_ref2.group(1):
-            tr_no = m_ref2.group(1).strip()
-    if not tr_no:
         tr_no = "QT1-Transmittal"
 
-    # 2. Bóc tách Date
+    # 2. Date
     date_str = extract_cover_date(full_text)
 
-    # 3. Bóc tách Subject
+    # 3. Subject
     subject = ""
     m_sub = re.search(r'(?:SUBJECT|Subject)\s*[:\s]+([^\n\r]+)', full_text, re.IGNORECASE)
     if m_sub:
         raw_sub = m_sub.group(1).strip()
         raw_sub = re.split(r'(?:Reference|Dear|Attn|Attachment|Document/Drawing|Sheet:)', raw_sub, flags=re.IGNORECASE)[0].strip()
-        # Loại bỏ các từ rác do format bảng nếu có
-        raw_sub = re.sub(r'Sheet:\s*.*$', '', raw_sub, flags=re.IGNORECASE).strip()
         subject = raw_sub
 
     if not subject and tr_no and filename:
@@ -125,15 +127,18 @@ def extract_letter_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
     if not subject:
         subject = "Official Transmittal"
 
-    # 4. Bóc tách danh mục tài liệu (Drawing/Doc Table)
+    # 4. Danh mục tài liệu chuẩn từ bảng Transmittal
     docs = {}
-    for line in full_text.splitlines():
+    lines = full_text.splitlines()
+    for line in lines:
         m_doc = re.search(r'(QT1-[0-9L]-[A-Za-z0-9_-]+)', line)
         if m_doc and "EVNPMB2" not in m_doc.group(1) and "QT1-HDH" not in m_doc.group(1):
             doc_code = m_doc.group(1).strip()
+            after = line[m_doc.end():].strip()
+            
             rev = "1"
             title = ""
-            after = line[m_doc.end():].strip()
+            # Phân tách theo cột
             parts = [p.strip() for p in re.split(r'[\t|]+', after) if p.strip()]
             if parts:
                 if len(parts[0]) <= 3 and parts[0].isalnum():
@@ -285,9 +290,9 @@ async def export_zip_full(
     files: list[UploadFile] = File(default=[]),
     cover_file: UploadFile = File(None),
     metadata: str = Form("{}"),
-    mode: str = Form("auto_bump"),
-    qti_no: str = Form("QTI-PECC1-PMB2-26-10-111"),
-    start_car_no: str = Form("9999"),
+    mode: str = Form("number_filled_cars"),
+    qti_no: str = Form("QTI-PECC1-PMB2-26-10-143"),
+    start_car_no: str = Form("9904"),
     custom_date: str = Form("")
 ):
     temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
@@ -310,7 +315,7 @@ async def export_zip_full(
         if cover_file is not None:
             cover_bytes = await cover_file.read()
             if cover_file.filename.lower().endswith('.pdf'):
-                cover_data = extract_letter_metadata(cover_bytes, cover_file.filename)
+                cover_data = extract_cover_metadata(cover_bytes, cover_file.filename)
             elif cover_file.filename.lower().endswith(('.xlsx', '.xls')):
                 cover_data = parse_cover_excel_bytes(cover_bytes, cover_file.filename)
             del cover_bytes
@@ -326,9 +331,9 @@ async def export_zip_full(
         processed_car_list = []
 
         try:
-            start_num = int(re.sub(r'\D', '', str(start_car_no)) or "9999")
+            start_num = int(re.sub(r'\D', '', str(start_car_no)) or "9904")
         except Exception:
-            start_num = 9999
+            start_num = 9904
 
         with zipfile.ZipFile(temp_zip_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
             if mode != "no_car_letter" and files:
@@ -337,9 +342,131 @@ async def export_zip_full(
                         content = await file.read()
 
                         # =========================================================================
-                        # CHẾ ĐỘ: AUTO BUMP (TỰ ĐỘNG TẠO ROUND MỚI R+1)
+                        # CHẾ ĐỘ 1: NUMBER FILLED CARS (KỸ SƯ ĐÃ ĐIỀN DỮ LIỆU - CHỈ CẤP SỐ & ĐỌC STATUS)
                         # =========================================================================
-                        if mode == "auto_bump":
+                        if mode == "number_filled_cars":
+                            cur_num = start_num + file_idx
+                            car_base = f"{cur_num:04d} CaRs" if cur_num < 10000 else f"{cur_num} CaRs"
+                            
+                            wb = openpyxl.load_workbook(io.BytesIO(content))
+                            max_r = 1
+                            target_ws = wb.active
+                            for s_name in wb.sheetnames:
+                                m = re.search(r'round\s*(\d+)', s_name, re.IGNORECASE)
+                                if m and int(m.group(1)) >= max_r:
+                                    max_r = int(m.group(1))
+                                    target_ws = wb[s_name]
+
+                            car_label = f"{car_base} R{max_r}"
+
+                            # Tìm cột G (cột nhận xét)
+                            com_col = None
+                            for c in range(1, target_ws.max_column + 1):
+                                val_h = str(target_ws.cell(row=11, column=c).value or "").upper()
+                                if f"ROUND {max_r} COMMENTS" in val_h or f"ROUND {max_r} COMMENT" in val_h:
+                                    com_col = c
+                                    break
+                            if not com_col: com_col = 7
+
+                            # BƯỚC 1: ĐỌC TỰ ĐỘNG CHÍNH XÁC STATUS TỪ FILE CARS CỦA KỸ SƯ
+                            detected_status_raw = "APPROVED (APP)"
+                            found_rfc = False
+                            found_awc = False
+                            found_rj = False
+                            for r in range(11, 16):
+                                v_st = str(target_ws.cell(row=r, column=com_col).value or "").strip().upper()
+                                if "RETURN FOR CORRECTIONS" in v_st or "(RFC)" in v_st or v_st == "RFC":
+                                    found_rfc = True
+                                elif "APPROVED WITH COMMENTS" in v_st or "(AWC)" in v_st or v_st == "AWC":
+                                    found_awc = True
+                                elif "REJECTED" in v_st or "(RJ)" in v_st or v_st == "RJ":
+                                    found_rj = True
+
+                            if found_rfc:
+                                detected_status_raw = "RETURN FOR CORRECTIONS (RFC)"
+                            elif found_awc:
+                                detected_status_raw = "APPROVED WITH COMMENTS (AWC)"
+                            elif found_rj:
+                                detected_status_raw = "REJECTED (RJ)"
+                            else:
+                                detected_status_raw = "APPROVED (APP)"
+
+                            # BƯỚC 2: BÓC TÁCH MÃ DOC VÀ TÊN TÀI LIỆU
+                            detected_doc_code = ""
+                            m_fdoc = re.search(r'(QT1-[A-Za-z0-9_-]+)', file.filename)
+                            if m_fdoc: detected_doc_code = m_fdoc.group(1)
+
+                            r4_val = str(target_ws.cell(row=4, column=com_col).value or "")
+                            m_c = re.search(r'(QT1-[A-Za-z0-9_-]+)', r4_val)
+                            if m_c: detected_doc_code = m_c.group(1)
+
+                            # Khớp thông tin với Thư Cover
+                            doc_keys = list(cover_data['docs'].keys())
+                            if detected_doc_code in cover_data['docs']:
+                                cover_info = cover_data['docs'][detected_doc_code]
+                            elif doc_keys and file_idx < len(doc_keys):
+                                cover_info = cover_data['docs'][doc_keys[file_idx]]
+                            elif doc_keys:
+                                cover_info = cover_data['docs'][doc_keys[0]]
+                            else:
+                                cover_info = {}
+
+                            final_doc_no = cover_info.get('doc_no', detected_doc_code if detected_doc_code else "QT1-Document")
+                            final_rev = cover_info.get('rev', '1')
+
+                            # Lấy title: Ưu tiên từ Thư Cover, nếu không có thì lấy ô G5 của kỹ sư, nếu không có mới lấy tên file
+                            r5_val = str(target_ws.cell(row=5, column=com_col).value or "").strip()
+                            if r5_val.lower() in ['iv', 'v', 'title of document', '']:
+                                r5_val = ""
+
+                            if cover_info.get('title'):
+                                final_title = cover_info['title']
+                            elif r5_val:
+                                final_title = r5_val
+                            else:
+                                clean_t = re.sub(r'^(?:Xxxx|\d+)\s*CaRs?\s*R\d+\s*', '', file.filename, flags=re.IGNORECASE)
+                                clean_t = os.path.splitext(clean_t)[0].strip()
+                                final_title = clean_t if clean_t else cover_data['subject']
+
+                            # BƯỚC 3: CẬP NHẬT HEADER CHUẨN VÀO FILE EXCEL
+                            # Cập nhật số CaR vào đúng ô E1 (cột 5) hoặc ô có chữ Xxxx (KHÔNG GHI ĐÈ VÀO Ô A1)
+                            e1_val = str(target_ws.cell(row=1, column=5).value or "")
+                            if "xxxx" in e1_val.lower() or not e1_val.strip():
+                                target_ws.cell(row=1, column=5).value = f"{car_base} - R{max_r}"
+                            else:
+                                for c in range(2, 10):
+                                    v = str(target_ws.cell(row=1, column=c).value or "")
+                                    if "xxxx" in v.lower():
+                                        target_ws.cell(row=1, column=c).value = f"{car_base} - R{max_r}"
+                                        break
+
+                            target_ws.cell(row=2, column=com_col).value = "EVNPMB2"
+                            target_ws.cell(row=3, column=com_col).value = cover_data['tr_no']
+                            target_ws.cell(row=4, column=com_col).value = f"{final_doc_no} rev.{final_rev}"
+                            target_ws.cell(row=5, column=com_col).value = final_title
+
+                            # BẢO TỒN NGUYÊN VẸN CÁC DÒNG NHẬN XÉT CỦA KỸ SƯ TỪ DÒNG 14 TRỞ ĐI
+                            safe_title_for_name = clean_safe_filename(final_title)
+                            new_excel_name = f"{car_base} R{max_r} {current_date_str} {final_doc_no} {safe_title_for_name} rev.{final_rev}.xlsx"
+
+                            excel_out = io.BytesIO()
+                            wb.save(excel_out)
+                            zip_file.writestr(new_excel_name, excel_out.getvalue())
+                            del wb, excel_out
+
+                            processed_car_list.append({
+                                'doc_no': final_doc_no,
+                                'rev': final_rev,
+                                'title': final_title,
+                                'status': detected_status_raw,
+                                'car_label': car_label,
+                                'assigned_car_name': new_excel_name
+                            })
+
+                        # =========================================================================
+                        # CHẾ ĐỘ 2: AUTO BUMP (TỰ ĐỘNG TẠO ROUND MỚI R+1)
+                        # =========================================================================
+                        elif mode == "auto_bump":
                             wb = openpyxl.load_workbook(io.BytesIO(content))
                             max_r = 1
                             target_sheet_name = wb.sheetnames[0]
@@ -362,7 +489,6 @@ async def export_zip_full(
                             wb._sheets.remove(new_ws)
                             wb._sheets.insert(target_idx + 1, new_ws)
                             
-                            # Tìm com_col
                             prev_com_col, prev_rep_col = None, None
                             for c in range(1, new_ws.max_column + 1):
                                 val_h = str(new_ws.cell(row=11, column=c).value or "").upper()
@@ -383,7 +509,7 @@ async def export_zip_full(
                             final_rev = cover_info.get('rev', '1')
                             final_title = cover_info.get('title', cover_data['subject'])
 
-                            for c in range(1, 10):
+                            for c in range(2, 10):
                                 v = str(new_ws.cell(row=1, column=c).value or "")
                                 if re.search(r'-\s*R\d+', v, re.IGNORECASE) or (c == 5 and v):
                                     new_ws.cell(row=1, column=c).value = re.sub(r'R\d+', f'R{new_r_num}', v, flags=re.IGNORECASE)
@@ -471,217 +597,7 @@ async def export_zip_full(
                             })
 
                         # =========================================================================
-                        # CHẾ ĐỘ: NUMBER FILLED CARS (KỸ SƯ ĐÃ ĐIỀN DỮ LIỆU - CHỈ CẤP SỐ & ĐỌC STATUS)
-                        # =========================================================================
-                        elif mode == "number_filled_cars":
-                            cur_num = start_num + file_idx
-                            car_base = f"{cur_num:04d} CaRs" if cur_num < 10000 else f"{cur_num} CaRs"
-                            
-                            wb = openpyxl.load_workbook(io.BytesIO(content))
-                            max_r = 1
-                            target_ws = wb.active
-                            for s_name in wb.sheetnames:
-                                m = re.search(r'round\s*(\d+)', s_name, re.IGNORECASE)
-                                if m and int(m.group(1)) >= max_r:
-                                    max_r = int(m.group(1))
-                                    target_ws = wb[s_name]
-
-                            car_label = f"{car_base} R{max_r}"
-
-                            # Tìm đúng cột ý kiến com_col
-                            com_col = None
-                            for c in range(1, target_ws.max_column + 1):
-                                val_h = str(target_ws.cell(row=11, column=c).value or "").upper()
-                                if f"ROUND {max_r} COMMENTS" in val_h or f"ROUND {max_r} COMMENT" in val_h:
-                                    com_col = c
-                                    break
-                            if not com_col: com_col = 7
-
-                            # BƯỚC 1: ĐỌC CHÍNH XÁC STATUS TỪ FILE CARS CỦA KỸ SƯ
-                            detected_status_raw = "APPROVED (APP)"
-                            found_rfc = False
-                            found_awc = False
-                            found_rj = False
-                            for r in range(11, 16):
-                                v_st = str(target_ws.cell(row=r, column=com_col).value or "").strip().upper()
-                                if "RETURN FOR CORRECTIONS" in v_st or "(RFC)" in v_st or v_st == "RFC":
-                                    found_rfc = True
-                                elif "APPROVED WITH COMMENTS" in v_st or "(AWC)" in v_st or v_st == "AWC":
-                                    found_awc = True
-                                elif "REJECTED" in v_st or "(RJ)" in v_st or v_st == "RJ":
-                                    found_rj = True
-
-                            if found_rfc:
-                                detected_status_raw = "RETURN FOR CORRECTIONS (RFC)"
-                            elif found_awc:
-                                detected_status_raw = "APPROVED WITH COMMENTS (AWC)"
-                            elif found_rj:
-                                detected_status_raw = "REJECTED (RJ)"
-                            else:
-                                detected_status_raw = "APPROVED (APP)"
-
-                            # BƯỚC 2: BÓC TÁCH MÃ DOC, REV, TITLE (TRÁNH BẮT NHẦM CỘT A CHỮ iv)
-                            detected_doc_code = ""
-                            m_fdoc = re.search(r'(QT1-[A-Za-z0-9_-]+)', file.filename)
-                            if m_fdoc: detected_doc_code = m_fdoc.group(1)
-
-                            r4_val = str(target_ws.cell(row=4, column=com_col).value or "")
-                            m_c = re.search(r'(QT1-[A-Za-z0-9_-]+)', r4_val)
-                            if m_c: detected_doc_code = m_c.group(1)
-
-                            # Khớp thông tin với Thư Cover
-                            doc_keys = list(cover_data['docs'].keys())
-                            if detected_doc_code in cover_data['docs']:
-                                cover_info = cover_data['docs'][detected_doc_code]
-                            elif doc_keys and file_idx < len(doc_keys):
-                                cover_info = cover_data['docs'][doc_keys[file_idx]]
-                            elif doc_keys:
-                                cover_info = cover_data['docs'][doc_keys[0]]
-                            else:
-                                cover_info = {}
-
-                            final_doc_no = cover_info.get('doc_no', detected_doc_code if detected_doc_code else "QT1-Document")
-                            final_rev = cover_info.get('rev', '1')
-                            
-                            # Lấy title chuẩn (Tránh chữ "iv" của cột A)
-                            r5_val = str(target_ws.cell(row=5, column=com_col).value or "").strip()
-                            if r5_val.lower() in ['iv', 'v', 'title of document', '']:
-                                r5_val = ""
-
-                            if cover_info.get('title'):
-                                final_title = cover_info['title']
-                            elif r5_val:
-                                final_title = r5_val
-                            else:
-                                # Lấy title từ tên file upload của kỹ sư (loại bỏ Xxxx CaRs R1)
-                                clean_t = re.sub(r'^(?:Xxxx|\d+)\s*CaRs?\s*R\d+\s*', '', file.filename, flags=re.IGNORECASE)
-                                clean_t = os.path.splitext(clean_t)[0].strip()
-                                final_title = clean_t if clean_t else cover_data['subject']
-
-                            # BƯỚC 3: CẬP NHẬT HEADER CHUẨN VÀO FILE EXCEL
-                            # Cập nhật số CaR vào dòng 1: "9904 CaRs - R1"
-                            for c in range(1, 10):
-                                v = str(target_ws.cell(row=1, column=c).value or "")
-                                if re.search(r'CaRs?', v, re.IGNORECASE) or (c == 5 and v):
-                                    target_ws.cell(row=1, column=c).value = f"{car_base} - R{max_r}"
-                                    break
-
-                            target_ws.cell(row=2, column=com_col).value = "EVNPMB2"
-                            target_ws.cell(row=3, column=com_col).value = cover_data['tr_no']
-                            target_ws.cell(row=4, column=com_col).value = f"{final_doc_no} rev.{final_rev}"
-                            target_ws.cell(row=5, column=com_col).value = final_title
-
-                            # BẢO TỒN NGUYÊN VẸN CÁC DÒNG NHẬN XÉT CỦA KỸ SƯ TỪ DÒNG 14 TRỞ ĐI
-                            safe_title_for_name = clean_safe_filename(final_title)
-                            new_excel_name = f"{car_base} R{max_r} {current_date_str} {final_doc_no} {safe_title_for_name} rev.{final_rev}.xlsx"
-
-                            excel_out = io.BytesIO()
-                            wb.save(excel_out)
-                            zip_file.writestr(new_excel_name, excel_out.getvalue())
-                            del wb, excel_out
-
-                            processed_car_list.append({
-                                'doc_no': final_doc_no,
-                                'rev': final_rev,
-                                'title': final_title,
-                                'status': detected_status_raw,
-                                'car_label': car_label,
-                                'assigned_car_name': new_excel_name
-                            })
-
-                        # =========================================================================
-                        # CHẾ ĐỘ: NEW CARS (TẠO CARS TỪ MẪU TRẮNG)
-                        # =========================================================================
-                        elif mode == "new_cars":
-                            cur_num = start_num + file_idx
-                            car_base = f"{cur_num:04d} CaRs" if cur_num < 10000 else f"{cur_num} CaRs"
-                            car_label = f"{car_base} R1"
-                            selected_status = car_metadata.get(file.filename, "APP")
-
-                            wb = openpyxl.load_workbook(io.BytesIO(content))
-                            target_ws = wb.active
-                            for s_name in wb.sheetnames:
-                                if re.search(r'round\s*1', s_name, re.IGNORECASE):
-                                    target_ws = wb[s_name]
-                                    break
-                            target_ws.title = "ROUND 1 CaRs"
-
-                            com_col = 8
-                            rep_col = com_col + 2
-
-                            detected_doc_code = ""
-                            m_fdoc = re.search(r'(QT1-[A-Za-z0-9_-]+)', file.filename)
-                            if m_fdoc: detected_doc_code = m_fdoc.group(1)
-
-                            doc_keys = list(cover_data['docs'].keys())
-                            if detected_doc_code in cover_data['docs']:
-                                cover_info = cover_data['docs'][detected_doc_code]
-                            elif doc_keys and file_idx < len(doc_keys):
-                                cover_info = cover_data['docs'][doc_keys[file_idx]]
-                            elif doc_keys:
-                                cover_info = cover_data['docs'][doc_keys[0]]
-                            else:
-                                cover_info = {}
-
-                            final_doc_no = cover_info.get('doc_no', detected_doc_code if detected_doc_code else f"QT1-Doc-{cur_num}")
-                            final_rev = cover_info.get('rev', '1')
-                            final_title = cover_info.get('title', cover_data['subject'])
-
-                            for c in range(1, 10):
-                                v = str(target_ws.cell(row=1, column=c).value or "")
-                                if re.search(r'CaRs?', v, re.IGNORECASE) or (c == 5 and v):
-                                    target_ws.cell(row=1, column=c).value = f"{car_base} - R1"
-                                    break
-
-                            target_ws.cell(row=2, column=com_col).value = "EVNPMB2"
-                            target_ws.cell(row=3, column=com_col).value = cover_data['tr_no']
-                            target_ws.cell(row=4, column=com_col).value = f"{final_doc_no} rev.{final_rev}"
-                            target_ws.cell(row=5, column=com_col).value = final_title
-                            target_ws.cell(row=10, column=rep_col).value = "CONTRACTOR's"
-                            target_ws.cell(row=11, column=com_col).value = "ROUND 1 COMMENTS"
-                            target_ws.cell(row=11, column=rep_col).value = "ROUND 1 REPLIES"
-
-                            status_full_text = "APPROVED (APP)" if selected_status == "APP" else "RETURN FOR CORRECTIONS (RFC)"
-                            if selected_status == "AWC": status_full_text = "APPROVED WITH COMMENTS (AWC)"
-                            elif selected_status == "RJ": status_full_text = "REJECTED (RJ)"
-
-                            target_ws.cell(row=12, column=com_col).value = "STATUS AFTER ROUND 1 COMMENTS:"
-                            target_ws.cell(row=13, column=com_col).value = status_full_text
-
-                            for r in range(1, 15):
-                                for c in range(1, target_ws.max_column + 1):
-                                    cell = target_ws.cell(row=r, column=c)
-                                    if cell.value and cell.font:
-                                        f = cell.font
-                                        color = f.color if f.color else None
-                                        cell.font = Font(name=f.name, size=f.sz, bold=True, italic=f.i, color=color)
-
-                            red_bold = Font(name="Arial", size=10, bold=True, color="FFFF0000")
-                            target_ws.cell(row=12, column=com_col).font = red_bold
-                            target_ws.cell(row=13, column=com_col).font = red_bold
-
-                            target_ws.column_dimensions[openpyxl.utils.get_column_letter(com_col)].width = 38
-                            target_ws.column_dimensions[openpyxl.utils.get_column_letter(rep_col)].width = 38
-
-                            safe_title_for_name = clean_safe_filename(final_title)
-                            new_excel_name = f"{car_base} R1 {current_date_str} {final_doc_no} {safe_title_for_name} rev.{final_rev}.xlsx"
-
-                            excel_out = io.BytesIO()
-                            wb.save(excel_out)
-                            zip_file.writestr(new_excel_name, excel_out.getvalue())
-                            del wb, excel_out
-
-                            processed_car_list.append({
-                                'doc_no': final_doc_no,
-                                'rev': final_rev,
-                                'title': final_title,
-                                'status': status_full_text,
-                                'car_label': car_label,
-                                'assigned_car_name': new_excel_name
-                            })
-
-                        # =========================================================================
-                        # CHẾ ĐỘ: PRE PREPARED (ĐÃ CÓ SẴN CAR)
+                        # CHẾ ĐỘ 3: PRE PREPARED (ĐÃ CÓ SẴN CAR)
                         # =========================================================================
                         else:
                             wb_ro = openpyxl.load_workbook(io.BytesIO(content), read_only=True)
@@ -736,7 +652,7 @@ async def export_zip_full(
                         traceback.print_exc()
 
             # =========================================================================
-            # CHẾ ĐỘ: TRẢ LỜI THƯ, KHÔNG CÓ CAR
+            # CHẾ ĐỘ 4: TRẢ LỜI THƯ, KHÔNG CÓ CAR
             # =========================================================================
             elif mode == "no_car_letter":
                 if cover_data['docs']:
