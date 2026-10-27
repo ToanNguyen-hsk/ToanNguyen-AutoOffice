@@ -30,6 +30,7 @@ def clean_safe_filename(name: str) -> str:
     return cleaned[:130] if len(cleaned) > 130 else cleaned
 
 def parse_single_date(s: str) -> str:
+    if not s: return ""
     month_map = {
         'jan': 1, 'january': 1, 'feb': 2, 'february': 2, 'mar': 3, 'march': 3,
         'apr': 4, 'april': 4, 'may': 5, 'jun': 6, 'june': 6, 'jul': 7, 'july': 7,
@@ -37,7 +38,8 @@ def parse_single_date(s: str) -> str:
         'oct': 10, 'october': 10, 'nov': 11, 'november': 11, 'dec': 12, 'december': 12
     }
     month_pat = r'(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)'
-    
+
+    # 1. Month Day, Year (vd: October 19, 2026)
     m1 = re.search(r'\b(' + month_pat + r')\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(202\d)\b', s, re.IGNORECASE)
     if m1:
         m_str = m1.group(1).lower()
@@ -46,6 +48,7 @@ def parse_single_date(s: str) -> str:
         if m_str in month_map and 1 <= d_val <= 31:
             return f"{d_val:02d}/{month_map[m_str]:02d}/{y_val}"
 
+    # 2. Day Month Year (vd: 19 October 2026)
     m2 = re.search(r'\b(\d{1,2})(?:st|nd|rd|th)?\s+(' + month_pat + r'),?\s+(202\d)\b', s, re.IGNORECASE)
     if m2:
         d_val = int(m2.group(1))
@@ -54,6 +57,7 @@ def parse_single_date(s: str) -> str:
         if m_str in month_map and 1 <= d_val <= 31:
             return f"{d_val:02d}/{month_map[m_str]:02d}/{y_val}"
 
+    # 3. DD/MM/YYYY
     m3 = re.search(r'\b(\d{1,2})[\/.-](\d{1,2})[\/.-](202\d)\b', s)
     if m3:
         d_val = int(m3.group(1))
@@ -67,23 +71,25 @@ def parse_single_date(s: str) -> str:
 def extract_ironclad_date(full_text: str, target_doc_no: str = "") -> str:
     month_pat = r'(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)'
     
-    purged_text = re.sub(r'Reference\(s\)[\s\S]*?(?=Dear\s+Sir|Date:|Ref\.|\Z)', '', full_text, flags=re.IGNORECASE)
-    purged_text = re.sub(r'\bdated\s+[^\n\r]+', '', purged_text, flags=re.IGNORECASE)
-    purged_text = re.sub(r'\bContract\s+Agreement[^\n\r]+', '', purged_text, flags=re.IGNORECASE)
-
-    p_date = r'\bDate\b\s*[:\s-]*\s*(' + month_pat + r'\s+\d{1,2}(?:st|nd|rd|th)?,?\s+202\d|\d{1,2}(?:st|nd|rd|th)?\s+' + month_pat + r',?\s+202\d|\d{1,2}[\/.-]\d{1,2}[\/.-]202\d)'
-    m_direct = re.search(p_date, purged_text, re.IGNORECASE)
+    # 1. Tìm trực tiếp nhãn Date: ...
+    p_date = r'\bDate\b[^\w\d]{0,25}(' + month_pat + r'\s+\d{1,2}(?:st|nd|rd|th)?,?\s+202\d|\d{1,2}(?:st|nd|rd|th)?\s+' + month_pat + r',?\s+202\d|\d{1,2}[\/.-]\d{1,2}[\/.-]202\d)'
+    m_direct = re.search(p_date, full_text, re.IGNORECASE)
     if m_direct:
         res = parse_single_date(m_direct.group(1))
         if res: return res
 
+    # 2. Tìm trong phạm vi lân cận mã công văn đích
     if target_doc_no:
-        idx = purged_text.find(target_doc_no)
+        idx = full_text.find(target_doc_no)
         if idx != -1:
-            snippet = purged_text[max(0, idx - 150): min(len(purged_text), idx + 150)]
-            res = parse_single_date(snippet)
+            snippet = full_text[max(0, idx - 180): min(len(full_text), idx + 180)]
+            snippet_clean = re.sub(r'\bdated\s+[^\n\r]+', '', snippet, flags=re.IGNORECASE)
+            res = parse_single_date(snippet_clean)
             if res: return res
 
+    # 3. Thanh trừng khối Reference(s) và tìm kiếm trên văn bản sạch
+    purged_text = re.sub(r'Reference\(s\)[\s\S]*?(?=Dear\s+Sir|\Z)', '', full_text, flags=re.IGNORECASE)
+    purged_text = re.sub(r'\bdated\s+[^\n\r]+', '', purged_text, flags=re.IGNORECASE)
     res = parse_single_date(purged_text)
     if res: return res
 
@@ -147,19 +153,74 @@ def parse_cover_pdf_bytes(pdf_bytes, filename=""):
         'docs': {}
     }
     
-    p1_txt = ""
-    visitor_parts = []
+    all_texts = []
     try:
         reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
-        if reader.pages:
-            p1_txt = reader.pages[0].extract_text() or ""
-            def visitor(text, cm, tm, fontDict, fontSize):
-                if text.strip(): visitor_parts.append(text.strip())
-            reader.pages[0].extract_text(visitor_text=visitor)
-    except Exception as e:
-        print(f"Lỗi đọc PDF pypdf: {e}")
+        for page in reader.pages:
+            try:
+                t = page.extract_text()
+                if t: all_texts.append(t)
+            except Exception:
+                pass
 
-    full_extracted = p1_txt + "\n" + " ".join(visitor_parts)
+            # Trích xuất sâu từ luồng dữ liệu thô (Content Streams)
+            try:
+                contents = page.get("/Contents")
+                if contents:
+                    if not isinstance(contents, list):
+                        contents = [contents]
+                    for c in contents:
+                        c_obj = c.get_object()
+                        if hasattr(c_obj, "get_data"):
+                            raw_data = c_obj.get_data().decode('latin1', errors='ignore')
+                            strings_in_stream = re.findall(r'\(([^)]+)\)', raw_data)
+                            if strings_in_stream:
+                                all_texts.append(" ".join(strings_in_stream))
+                            all_texts.append(raw_data)
+            except Exception:
+                pass
+
+            # Trích xuất từ Form XObjects
+            try:
+                res = page.get("/Resources")
+                if res and "/XObject" in res:
+                    xobjs = res["/XObject"].get_object()
+                    for k in xobjs:
+                        xo = xobjs[k].get_object()
+                        if hasattr(xo, "get_data"):
+                            raw_data = xo.get_data().decode('latin1', errors='ignore')
+                            strings_in_stream = re.findall(r'\(([^)]+)\)', raw_data)
+                            if strings_in_stream:
+                                all_texts.append(" ".join(strings_in_stream))
+                            all_texts.append(raw_data)
+            except Exception:
+                pass
+
+            # Trích xuất từ chú thích (Annotations)
+            try:
+                annots = page.get("/Annots")
+                if annots:
+                    for a in annots:
+                        ao = a.get_object()
+                        for key in ["/Contents", "/V", "/TU"]:
+                            if key in ao:
+                                all_texts.append(str(ao[key]))
+                        if "/AP" in ao:
+                            ap = ao["/AP"].get_object()
+                            for s_key in ap:
+                                s = ap[s_key].get_object()
+                                if hasattr(s, "get_data"):
+                                    raw_data = s.get_data().decode('latin1', errors='ignore')
+                                    strings_in_stream = re.findall(r'\(([^)]+)\)', raw_data)
+                                    if strings_in_stream:
+                                        all_texts.append(" ".join(strings_in_stream))
+                                    all_texts.append(raw_data)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"Lỗi đọc PDF: {e}")
+
+    full_extracted = "\n".join(all_texts)
 
     if full_extracted:
         ref_patterns = [
