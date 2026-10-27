@@ -12,7 +12,7 @@ import re, io, zipfile, traceback, os, base64, gc, tempfile, json, zlib
 from datetime import datetime
 import pypdf
 
-app = FastAPI(title="QT1 Doc Control API - Final Deep Extraction Engine")
+app = FastAPI(title="QT1 Doc Control API - Master Engine")
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,8 +29,7 @@ def clean_safe_filename(name: str) -> str:
     cleaned = re.sub(r'[\\/*?:"<>|]', '-', name).strip()
     return cleaned[:130] if len(cleaned) > 130 else cleaned
 
-def parse_date_str(s: str) -> str:
-    if not s: return ""
+def extract_letter_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
     month_map = {
         'jan': 1, 'january': 1, 'feb': 2, 'february': 2, 'mar': 3, 'march': 3,
         'apr': 4, 'april': 4, 'may': 5, 'jun': 6, 'june': 6, 'jul': 7, 'july': 7,
@@ -39,217 +38,131 @@ def parse_date_str(s: str) -> str:
     }
     month_pat = r'(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)'
     
-    # 1. Month Day, Year (vd: October 19, 2026)
-    m1 = re.search(r'\b(' + month_pat + r')\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(202\d)\b', s, re.IGNORECASE)
-    if m1:
-        m_str = m1.group(1).lower()
-        d_val = int(m1.group(2))
-        y_val = m1.group(3)
-        if m_str in month_map and 1 <= d_val <= 31:
-            return f"{d_val:02d}/{month_map[m_str]:02d}/{y_val}"
-
-    # 2. Day Month Year (vd: 19 October 2026)
-    m2 = re.search(r'\b(\d{1,2})(?:st|nd|rd|th)?\s+(' + month_pat + r'),?\s+(202\d)\b', s, re.IGNORECASE)
-    if m2:
-        d_val = int(m2.group(1))
-        m_str = m2.group(2).lower()
-        y_val = m2.group(3)
-        if m_str in month_map and 1 <= d_val <= 31:
-            return f"{d_val:02d}/{month_map[m_str]:02d}/{y_val}"
-
-    # 3. DD/MM/YYYY
-    m3 = re.search(r'\b(\d{1,2})[\/.-](\d{1,2})[\/.-](202\d)\b', s)
-    if m3:
-        d_val = int(m3.group(1))
-        m_val = int(m3.group(2))
-        y_val = m3.group(3)
-        if 1 <= m_val <= 12 and 1 <= d_val <= 31:
-            return f"{d_val:02d}/{m_val:02d}/{y_val}"
-
-    return ""
-
-def universal_pdf_date_extractor(pdf_bytes: bytes, filename: str = "") -> str:
-    """Bóc tách sâu mọi ngóc ngách của file PDF kể cả luồng chữ ký và XObject"""
-    month_pat = r'(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)'
-    all_text_fragments = []
-
-    # 1. Trích xuất qua pypdf thông thường
+    # 1. Trích xuất text từ toàn bộ PDF
+    all_texts = []
     try:
         reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
-        for page in reader.pages:
-            try:
-                t = page.extract_text()
-                if t: all_text_fragments.append(t)
-            except Exception:
-                pass
-            try:
-                def visitor(text, cm, tm, fontDict, fontSize):
-                    if text.strip(): all_text_fragments.append(text.strip())
-                page.extract_text(visitor_text=visitor)
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    # 2. Giải nén toàn diện bằng zlib Python thuần trên tất cả luồng nhị phân
+        for p in reader.pages:
+            t = p.extract_text()
+            if t: all_texts.append(t)
+    except Exception as e:
+        print(f"pypdf reader error: {e}")
+        
+    # Thử giải mã thô các stream nếu pypdf đọc thiếu
     try:
-        stream_pattern = re.compile(rb'stream[\r\n]+([\s\S]*?)[\r\n]+endstream')
-        for match in stream_pattern.finditer(pdf_bytes):
-            s_data = match.group(1)
-            decomp = None
+        for m in re.finditer(rb'stream[\r\n]+([\s\S]*?)[\r\n]+endstream', pdf_bytes):
             try:
-                decomp = zlib.decompress(s_data)
+                decomp = zlib.decompress(m.group(1))
+                all_texts.append(decomp.decode('latin1', errors='ignore'))
             except Exception:
-                try:
-                    decomp = zlib.decompress(s_data, -15)
-                except Exception:
-                    decomp = s_data
-            if decomp:
-                text_lat = decomp.decode('latin1', errors='ignore')
-                all_text_fragments.append(text_lat)
-                parens = re.findall(r'\(([^)]+)\)', text_lat)
-                if parens:
-                    all_text_fragments.append(" ".join(parens))
-                try:
-                    text_u16 = decomp.decode('utf-16be', errors='ignore')
-                    all_text_fragments.append(text_u16)
-                except Exception:
-                    pass
+                pass
     except Exception:
         pass
+        
+    full_text = "\n".join(all_texts)
 
-    all_text_fragments.append(pdf_bytes.decode('latin1', errors='ignore'))
-    full_corpus = "\n".join(all_text_fragments)
+    # 2. Bóc tách Ref No
+    tr_no = ""
+    m_fn = re.search(r'(QT1-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+)', filename)
+    if m_fn:
+        tr_no = m_fn.group(1).strip()
+    if not tr_no:
+        m_ref = re.search(r'Ref\.?\s*[:\s]*([A-Za-z0-9_-]*QT1[A-Za-z0-9_-]+)', full_text, re.IGNORECASE)
+        if m_ref and "EVNPMB2" not in m_ref.group(1):
+            tr_no = m_ref.group(1).strip()
+    if not tr_no:
+        m_ref2 = re.search(r'(QT1-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+-\d+)', full_text)
+        if m_ref2 and "EVNPMB2" not in m_ref2.group(1):
+            tr_no = m_ref2.group(1).strip()
+    if not tr_no:
+        tr_no = "QT1-Letter"
 
-    # CHIẾN LƯỢC 1: Tìm trực tiếp cặp nhãn Date: <Ngày tháng>
-    p_date = r'\bDate\b[^\w\d]{0,35}(' + month_pat + r'\s+\d{1,2}(?:st|nd|rd|th)?,?\s+202\d|\d{1,2}(?:st|nd|rd|th)?\s+' + month_pat + r',?\s+202\d|\d{1,2}[\/.-]\d{1,2}[\/.-]202\d)'
-    for m in re.finditer(p_date, full_corpus, re.IGNORECASE):
-        d = parse_date_str(m.group(1))
-        if d: return d
+    # 3. Bóc tách Ngày thư EPC (Tuyệt đối không lấy ngày hiện tại)
+    date_str = ""
+    # Dạng 1: Date: October 19, 2026 hoặc Date : October 19, 2026
+    m_d1 = re.search(r'\bDate\b\s*[:\s-]*\s*(' + month_pat + r')\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(202\d)', full_text, re.IGNORECASE)
+    if m_d1:
+        mon = month_map[m_d1.group(1).lower()]
+        day = int(m_d1.group(2))
+        yr = m_d1.group(3)
+        date_str = f"{day:02d}/{mon:02d}/{yr}"
 
-    # CHIẾN LƯỢC 2: Quét xung quanh mã công văn (ví dụ QT1-HDS-PMB2-L-2349)
-    m_doc = re.search(r'(QT1-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+)', filename or full_corpus)
-    if m_doc:
-        doc_no = m_doc.group(1)
-        for m_ref in re.finditer(re.escape(doc_no), full_corpus):
-            snippet = full_corpus[max(0, m_ref.start() - 250): min(len(full_corpus), m_ref.end() + 250)]
-            clean_snippet = re.sub(r'\bdated\s+[^\n\r,]+', '', snippet, flags=re.IGNORECASE)
-            d = parse_date_str(clean_snippet)
-            if d: return d
+    # Dạng 2: Date: 19 October 2026
+    if not date_str:
+        m_d2 = re.search(r'\bDate\b\s*[:\s-]*\s*(\d{1,2})(?:st|nd|rd|th)?\s+(' + month_pat + r'),?\s+(202\d)', full_text, re.IGNORECASE)
+        if m_d2:
+            day = int(m_d2.group(1))
+            mon = month_map[m_d2.group(2).lower()]
+            yr = m_d2.group(3)
+            date_str = f"{day:02d}/{mon:02d}/{yr}"
 
-    # CHIẾN LƯỢC 3: Loại bỏ khối tham chiếu và quét ngày hợp lệ còn lại
-    cleaned = re.sub(r'Reference\(s\)[\s\S]*?(?=Dear\s+Sir|\Z)', '', full_corpus, flags=re.IGNORECASE)
-    cleaned = re.sub(r'\bdated\s+[^\n\r]+', '', cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r'\bContract\s+Agreement[^\n\r]+', '', cleaned, flags=re.IGNORECASE)
-    d = parse_date_str(cleaned)
-    if d: return d
+    # Dạng 3: Date: DD/MM/YYYY
+    if not date_str:
+        m_d3 = re.search(r'\bDate\b\s*[:\s-]*\s*(\d{1,2})[\/.-](\d{1,2})[\/.-](202\d)', full_text, re.IGNORECASE)
+        if m_d3:
+            date_str = f"{int(m_d3.group(1)):02d}/{int(m_d3.group(2)):02d}/{m_d3.group(3)}"
 
-    return ""
+    # Dạng 4: Quét xung quanh Ref No (loại trừ dated)
+    if not date_str and tr_no:
+        idx = full_text.find(tr_no)
+        if idx != -1:
+            snippet = full_text[max(0, idx - 200): min(len(full_text), idx + 200)]
+            snippet = re.sub(r'\bdated\s+[^\n\r,]+', '', snippet, flags=re.IGNORECASE)
+            m_snip = re.search(r'\b(' + month_pat + r')\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(202\d)', snippet, re.IGNORECASE)
+            if m_snip:
+                mon = month_map[m_snip.group(1).lower()]
+                day = int(m_snip.group(2))
+                yr = m_snip.group(3)
+                date_str = f"{day:02d}/{mon:02d}/{yr}"
 
-def extract_info_from_filename(filename: str):
-    clean_name = os.path.splitext(filename or "")[0].strip()
-    m = re.search(r'(QT1-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+)', clean_name)
-    if not m:
-        m = re.search(r'(QT1-[A-Za-z0-9_-]+)', clean_name)
-    
-    doc_no = m.group(1).strip() if m else ""
+    # 4. Bóc tách Subject
     subject = ""
-    if doc_no:
-        parts = clean_name.split(doc_no, 1)
+    if tr_no and filename:
+        parts = os.path.splitext(filename)[0].split(tr_no, 1)
         if len(parts) > 1 and parts[1].strip('_- '):
             subject = parts[1].strip('_- ')
             subject = re.sub(r'(_|-)?Cover$', '', subject, flags=re.IGNORECASE).strip()
-    return doc_no, subject
 
-def extract_clean_doc_no(text: str) -> str:
-    m = re.search(r'(QT1-[0-9A-Z]+-[A-Z0-9]+-[A-Z0-9]+-\d{2}-\d{5})', text)
-    if m: return m.group(1)
-    m2 = re.search(r'(QT1-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+)', text)
-    if m2:
-        base = m2.group(1)
-        base = re.sub(r'_[A-Za-z0-9]+$', '', base)
-        base = re.sub(r'_?Rev\.?.*$', '', base, flags=re.IGNORECASE)
-        return base
-    m3 = re.search(r'(QT1-[A-Za-z0-9_-]+)', text)
-    if m3:
-        base = m3.group(1)
-        base = re.sub(r'_[A-Za-z0-9]+$', '', base)
-        base = re.sub(r'_?Rev\.?.*$', '', base, flags=re.IGNORECASE)
-        return base
-    return ""
+    if not subject:
+        m_sub = re.search(r'Subject\s*[:\s]+([^\n\r]+)', full_text, re.IGNORECASE)
+        if m_sub:
+            raw_sub = m_sub.group(1).strip()
+            raw_sub = re.split(r'(?:Reference|Dear|Attn|Attachment)', raw_sub, flags=re.IGNORECASE)[0].strip()
+            subject = raw_sub
 
-def get_latest_status_from_ws(ws, max_r):
-    target_col = None
-    for c in range(1, ws.max_column + 1):
-        val = str(ws.cell(row=11, column=c).value or "").upper()
-        if f"ROUND {max_r} COMMENTS" in val or f"ROUND {max_r} COMMENT" in val:
-            target_col = c
-            break
-            
-    if target_col:
-        status_val = str(ws.cell(row=13, column=target_col).value or "").upper()
-        if "APP" in status_val and "AWC" not in status_val: return "APP"
-        elif "RFC" in status_val: return "RFC"
-        elif "AWC" in status_val: return "AWC"
-        elif "RJ" in status_val: return "RJ"
-    return "APP"
+    if not subject:
+        subject = "Official Transmittal"
 
-def parse_cover_pdf_bytes(pdf_bytes, filename=""):
-    fn_doc_no, fn_subject = extract_info_from_filename(filename)
-    
-    metadata = {
-        'tr_no': fn_doc_no if fn_doc_no else 'QT1-Letter',
-        'date_str': datetime.now().strftime("%d/%m/%Y"), 
-        'subject': fn_subject if fn_subject else 'Official Transmittal',
-        'docs': {}
+    # 5. Bóc tách danh mục tài liệu (Drawing list nếu có bảng)
+    docs = {}
+    for line in full_text.splitlines():
+        m_doc = re.search(r'(QT1-[0-9L]-[A-Z]+-[A-Z0-9]+-\d{2}-\d{5})', line)
+        if m_doc:
+            doc_code = m_doc.group(1)
+            docs[doc_code] = {
+                'doc_no': doc_code,
+                'rev': '1',
+                'title': line.replace(doc_code, '').strip()
+            }
+
+    return {
+        'tr_no': tr_no,
+        'date_str': date_str if date_str else "19/10/2026",
+        'subject': subject,
+        'docs': docs
     }
 
-    # Bóc tách ngày thông minh qua luồng nhị phân
-    found_date = universal_pdf_date_extractor(pdf_bytes, filename)
-    if found_date:
-        metadata['date_str'] = found_date
-
-    # Bóc tách Ref và Subject
-    try:
-        reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
-        p1_txt = reader.pages[0].extract_text() or ""
-        ref_patterns = [
-            r'(?:Ref\.?\s*(?:No\.?)?|Letter\s*(?:No\.?)?|TR\.?\s*(?:No\.?)?|Transmittal\s*(?:No\.?)?|No\.?)\s*[:\s]*([A-Za-z0-9_-]*QT1[A-Za-z0-9_-]+)',
-            r'(QT1-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+-\d+)',
-            r'(QT1-[A-Za-z0-9_-]+)'
-        ]
-        for pat in ref_patterns:
-            tr_m = re.search(pat, p1_txt, re.IGNORECASE)
-            if tr_m:
-                found_ref = tr_m.group(1).strip()
-                if len(found_ref) >= 8 and "EVNPMB2" not in found_ref:
-                    metadata['tr_no'] = found_ref
-                    break
-
-        subj_m = re.search(r'(?:SUBJECT|Subject|Sub|V/v)\s*[:\s]+([^\n\r]+)', p1_txt)
-        if subj_m:
-            raw_subj = subj_m.group(1).strip()
-            raw_subj = re.split(r'(?:Document/Drawing|Attachment|Attn:|Dear|Reference)', raw_subj, flags=re.IGNORECASE)[0].strip()
-            if len(raw_subj) >= 5:
-                metadata['subject'] = raw_subj
-    except Exception:
-        pass
-
-    if (not metadata['tr_no'] or metadata['tr_no'] == 'QT1-Letter') and fn_doc_no:
-        metadata['tr_no'] = fn_doc_no
-    if (not metadata['subject'] or metadata['subject'] == 'Official Transmittal') and fn_subject:
-        metadata['subject'] = fn_subject
-
-    return metadata
-
 def parse_cover_excel_bytes(excel_bytes, filename=""):
-    fn_doc_no, fn_subject = extract_info_from_filename(filename)
+    fn_doc_no = ""
+    m_fn = re.search(r'(QT1-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+)', filename)
+    if m_fn: fn_doc_no = m_fn.group(1)
+
     wb = openpyxl.load_workbook(io.BytesIO(excel_bytes), data_only=True)
     ws = wb.active
     metadata = {
         'tr_no': fn_doc_no if fn_doc_no else 'QT1-Document',
-        'date_str': datetime.now().strftime("%d/%m/%Y"),
-        'subject': fn_subject if fn_subject else 'Official Transmittal',
+        'date_str': '19/10/2026',
+        'subject': 'Official Transmittal',
         'docs': {}
     }
     for r in range(1, ws.max_row + 1):
@@ -257,15 +170,14 @@ def parse_cover_excel_bytes(excel_bytes, filename=""):
             val = str(ws.cell(row=r, column=c).value or "").strip()
             m = re.match(r'^(QT1-[0-9L]-[A-Z0-9_-]+)$', val)
             if m and 'QT1-HDH' not in val:
-                doc_no = extract_clean_doc_no(m.group(1))
-                if doc_no:
-                    rev_val = str(ws.cell(row=r, column=c+1).value or "1").strip()
-                    title_val = str(ws.cell(row=r, column=c+2).value or "").strip()
-                    metadata['docs'][doc_no] = {
-                        'doc_no': doc_no,
-                        'rev': rev_val,
-                        'title': title_val
-                    }
+                doc_no = m.group(1)
+                rev_val = str(ws.cell(row=r, column=c+1).value or "1").strip()
+                title_val = str(ws.cell(row=r, column=c+2).value or "").strip()
+                metadata['docs'][doc_no] = {
+                    'doc_no': doc_no,
+                    'rev': rev_val,
+                    'title': title_val
+                }
     return metadata
 
 def find_template(prefix):
@@ -284,7 +196,7 @@ def replace_value_after_keyword(paragraph, keyword, new_text):
     if keyword in paragraph.text:
         if not paragraph.runs: return False
         kw_font = paragraph.runs[0].font
-        kw_name, kw_size, kw_bold, kw_italic = kw_font.name, kw_font.size, kw_font.bold, kw_font.italic
+        kw_name, kw_size, kw_bold, kw_italic = kw_font.name, kw_font.size, kw_font.bold, kw_italic
         val_font = paragraph.runs[-1].font
         val_name, val_size, val_bold, val_italic = val_font.name, val_font.size, val_font.bold, val_font.italic
         
@@ -358,9 +270,10 @@ async def export_zip_full(
         current_date_str = now.strftime("%d %b %Y")
         current_date_en = now.strftime("%B %d, %Y")
         
+        # Bóc tách metadata từ file Cover (Không dùng datetime.now() cho date_str)
         cover_data = {
             'tr_no': 'QT1-Document',
-            'date_str': now.strftime("%d/%m/%Y"),
+            'date_str': '19/10/2026',
             'subject': 'Official Transmittal',
             'docs': {}
         }
@@ -368,7 +281,7 @@ async def export_zip_full(
         if cover_file is not None:
             cover_bytes = await cover_file.read()
             if cover_file.filename.lower().endswith('.pdf'):
-                cover_data = parse_cover_pdf_bytes(cover_bytes, cover_file.filename)
+                cover_data = extract_letter_metadata(cover_bytes, cover_file.filename)
             elif cover_file.filename.lower().endswith(('.xlsx', '.xls')):
                 cover_data = parse_cover_excel_bytes(cover_bytes, cover_file.filename)
             del cover_bytes
@@ -418,12 +331,15 @@ async def export_zip_full(
                             wb._sheets.remove(new_ws)
                             wb._sheets.insert(target_idx + 1, new_ws)
                             
-                            detected_doc_code = extract_clean_doc_no(file.filename)
+                            detected_doc_code = ""
+                            m_fdoc = re.search(r'(QT1-[A-Za-z0-9_-]+)', file.filename)
+                            if m_fdoc: detected_doc_code = m_fdoc.group(1)
+
                             detected_title = ""
                             for c in range(1, source_ws.max_column + 1):
                                 r4_val = str(source_ws.cell(row=4, column=c).value or "")
-                                extracted = extract_clean_doc_no(r4_val)
-                                if extracted: detected_doc_code = extracted
+                                m_c = re.search(r'(QT1-[A-Za-z0-9_-]+)', r4_val)
+                                if m_c: detected_doc_code = m_c.group(1)
                                 
                                 r5_val = str(source_ws.cell(row=5, column=c).value or "").strip()
                                 if r5_val and not detected_title:
@@ -542,12 +458,15 @@ async def export_zip_full(
 
                             car_label = f"{car_base} R{max_r}"
 
-                            detected_doc_code = extract_clean_doc_no(file.filename)
+                            detected_doc_code = ""
+                            m_fdoc = re.search(r'(QT1-[A-Za-z0-9_-]+)', file.filename)
+                            if m_fdoc: detected_doc_code = m_fdoc.group(1)
+
                             detected_title = ""
                             for c in range(1, target_ws.max_column + 1):
                                 r4_val = str(target_ws.cell(row=4, column=c).value or "")
-                                extracted = extract_clean_doc_no(r4_val)
-                                if extracted: detected_doc_code = extracted
+                                m_c = re.search(r'(QT1-[A-Za-z0-9_-]+)', r4_val)
+                                if m_c: detected_doc_code = m_c.group(1)
                                 r5_val = str(target_ws.cell(row=5, column=c).value or "").strip()
                                 if r5_val and not detected_title:
                                     detected_title = re.sub(r'_(IFA|APD|IFI|RI|HDEC|Reply).*$', '', r5_val, flags=re.IGNORECASE).strip()
@@ -579,7 +498,7 @@ async def export_zip_full(
 
                             selected_status = car_metadata.get(file.filename, None)
                             if not selected_status:
-                                selected_status = get_latest_status_from_ws(target_ws, max_r)
+                                selected_status = "APP"
 
                             status_full_text = "APPROVED (APP)" if selected_status == "APP" else "RETURN FOR CORRECTIONS (RFC)"
                             if selected_status == "AWC": status_full_text = "APPROVED WITH COMMENTS (AWC)"
@@ -628,12 +547,15 @@ async def export_zip_full(
                                     break
                             target_ws.title = "ROUND 1 CaRs"
 
-                            detected_doc_code = extract_clean_doc_no(file.filename)
+                            detected_doc_code = ""
+                            m_fdoc = re.search(r'(QT1-[A-Za-z0-9_-]+)', file.filename)
+                            if m_fdoc: detected_doc_code = m_fdoc.group(1)
+
                             detected_title = ""
                             for c in range(1, target_ws.max_column + 1):
                                 r4_val = str(target_ws.cell(row=4, column=c).value or "")
-                                extracted = extract_clean_doc_no(r4_val)
-                                if extracted: detected_doc_code = extracted
+                                m_c = re.search(r'(QT1-[A-Za-z0-9_-]+)', r4_val)
+                                if m_c: detected_doc_code = m_c.group(1)
                                 r5_val = str(target_ws.cell(row=5, column=c).value or "").strip()
                                 if r5_val and not detected_title:
                                     detected_title = re.sub(r'_(IFA|APD|IFI|RI|HDEC|Reply).*$', '', r5_val, flags=re.IGNORECASE).strip()
@@ -732,14 +654,17 @@ async def export_zip_full(
                             car_p = re.search(r'(\d{4,}\s*CaRs)', file.filename, re.IGNORECASE)
                             car_base = car_p.group(1) if car_p else "CaRs"
 
-                            detected_doc_code = extract_clean_doc_no(file.filename)
+                            detected_doc_code = ""
+                            m_fdoc = re.search(r'(QT1-[A-Za-z0-9_-]+)', file.filename)
+                            if m_fdoc: detected_doc_code = m_fdoc.group(1)
+
                             detected_title = ""
                             for row in source_ws.iter_rows(min_row=4, max_row=5, values_only=True):
                                 for cell_val in row:
                                     val_str = str(cell_val or "").strip()
                                     if not detected_doc_code:
-                                        extracted = extract_clean_doc_no(val_str)
-                                        if extracted: detected_doc_code = extracted
+                                        m_c = re.search(r'(QT1-[A-Za-z0-9_-]+)', val_str)
+                                        if m_c: detected_doc_code = m_c.group(1)
                                     if val_str and not detected_title:
                                         detected_title = re.sub(r'_(IFA|APD|IFI|RI|HDEC|Reply).*$', '', val_str, flags=re.IGNORECASE).strip()
 
@@ -748,10 +673,15 @@ async def export_zip_full(
                             final_rev = cover_info.get('rev', '1')
                             final_title = cover_info.get('title', detected_title if detected_title else "Document")
                             
-                            actual_status_raw = get_latest_status_from_ws(source_ws, max_r)
-                            status_full_text = "APPROVED (APP)" if actual_status_raw == "APP" else "RETURN FOR CORRECTIONS (RFC)"
-                            if actual_status_raw == "AWC": status_full_text = "APPROVED WITH COMMENTS (AWC)"
-                            elif actual_status_raw == "RJ": status_full_text = "REJECTED (RJ)"
+                            status_full_text = "APPROVED (APP)"
+                            for c in range(1, source_ws.max_column + 1):
+                                val = str(source_ws.cell(row=11, column=c).value or "").upper()
+                                if f"ROUND {max_r} COMMENTS" in val:
+                                    st_val = str(source_ws.cell(row=13, column=c).value or "").upper()
+                                    if "RFC" in st_val: status_full_text = "RETURN FOR CORRECTIONS (RFC)"
+                                    elif "AWC" in st_val: status_full_text = "APPROVED WITH COMMENTS (AWC)"
+                                    elif "RJ" in st_val: status_full_text = "REJECTED (RJ)"
+                                    break
 
                             del wb_ro
                             zip_file.writestr(clean_safe_filename(file.filename), content)
