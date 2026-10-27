@@ -8,11 +8,11 @@ from copy import copy
 from docx import Document
 from docx.shared import Pt, Inches, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-import re, io, zipfile, traceback, os, base64, gc, tempfile, json
+import re, io, zipfile, traceback, os, base64, gc, tempfile, json, zlib
 from datetime import datetime
 import pypdf
 
-app = FastAPI(title="QT1 Doc Control API - Ironclad Final Engine")
+app = FastAPI(title="QT1 Doc Control API - Final Deep Extraction Engine")
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,7 +29,7 @@ def clean_safe_filename(name: str) -> str:
     cleaned = re.sub(r'[\\/*?:"<>|]', '-', name).strip()
     return cleaned[:130] if len(cleaned) > 130 else cleaned
 
-def parse_single_date(s: str) -> str:
+def parse_date_str(s: str) -> str:
     if not s: return ""
     month_map = {
         'jan': 1, 'january': 1, 'feb': 2, 'february': 2, 'mar': 3, 'march': 3,
@@ -38,7 +38,7 @@ def parse_single_date(s: str) -> str:
         'oct': 10, 'october': 10, 'nov': 11, 'november': 11, 'dec': 12, 'december': 12
     }
     month_pat = r'(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)'
-
+    
     # 1. Month Day, Year (vd: October 19, 2026)
     m1 = re.search(r'\b(' + month_pat + r')\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(202\d)\b', s, re.IGNORECASE)
     if m1:
@@ -68,30 +68,81 @@ def parse_single_date(s: str) -> str:
 
     return ""
 
-def extract_ironclad_date(full_text: str, target_doc_no: str = "") -> str:
+def universal_pdf_date_extractor(pdf_bytes: bytes, filename: str = "") -> str:
+    """Bóc tách sâu mọi ngóc ngách của file PDF kể cả luồng chữ ký và XObject"""
     month_pat = r'(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)'
-    
-    # 1. Tìm trực tiếp nhãn Date: ...
-    p_date = r'\bDate\b[^\w\d]{0,25}(' + month_pat + r'\s+\d{1,2}(?:st|nd|rd|th)?,?\s+202\d|\d{1,2}(?:st|nd|rd|th)?\s+' + month_pat + r',?\s+202\d|\d{1,2}[\/.-]\d{1,2}[\/.-]202\d)'
-    m_direct = re.search(p_date, full_text, re.IGNORECASE)
-    if m_direct:
-        res = parse_single_date(m_direct.group(1))
-        if res: return res
+    all_text_fragments = []
 
-    # 2. Tìm trong phạm vi lân cận mã công văn đích
-    if target_doc_no:
-        idx = full_text.find(target_doc_no)
-        if idx != -1:
-            snippet = full_text[max(0, idx - 180): min(len(full_text), idx + 180)]
-            snippet_clean = re.sub(r'\bdated\s+[^\n\r]+', '', snippet, flags=re.IGNORECASE)
-            res = parse_single_date(snippet_clean)
-            if res: return res
+    # 1. Trích xuất qua pypdf thông thường
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+        for page in reader.pages:
+            try:
+                t = page.extract_text()
+                if t: all_text_fragments.append(t)
+            except Exception:
+                pass
+            try:
+                def visitor(text, cm, tm, fontDict, fontSize):
+                    if text.strip(): all_text_fragments.append(text.strip())
+                page.extract_text(visitor_text=visitor)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
-    # 3. Thanh trừng khối Reference(s) và tìm kiếm trên văn bản sạch
-    purged_text = re.sub(r'Reference\(s\)[\s\S]*?(?=Dear\s+Sir|\Z)', '', full_text, flags=re.IGNORECASE)
-    purged_text = re.sub(r'\bdated\s+[^\n\r]+', '', purged_text, flags=re.IGNORECASE)
-    res = parse_single_date(purged_text)
-    if res: return res
+    # 2. Giải nén toàn diện bằng zlib Python thuần trên tất cả luồng nhị phân
+    try:
+        stream_pattern = re.compile(rb'stream[\r\n]+([\s\S]*?)[\r\n]+endstream')
+        for match in stream_pattern.finditer(pdf_bytes):
+            s_data = match.group(1)
+            decomp = None
+            try:
+                decomp = zlib.decompress(s_data)
+            except Exception:
+                try:
+                    decomp = zlib.decompress(s_data, -15)
+                except Exception:
+                    decomp = s_data
+            if decomp:
+                text_lat = decomp.decode('latin1', errors='ignore')
+                all_text_fragments.append(text_lat)
+                parens = re.findall(r'\(([^)]+)\)', text_lat)
+                if parens:
+                    all_text_fragments.append(" ".join(parens))
+                try:
+                    text_u16 = decomp.decode('utf-16be', errors='ignore')
+                    all_text_fragments.append(text_u16)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    all_text_fragments.append(pdf_bytes.decode('latin1', errors='ignore'))
+    full_corpus = "\n".join(all_text_fragments)
+
+    # CHIẾN LƯỢC 1: Tìm trực tiếp cặp nhãn Date: <Ngày tháng>
+    p_date = r'\bDate\b[^\w\d]{0,35}(' + month_pat + r'\s+\d{1,2}(?:st|nd|rd|th)?,?\s+202\d|\d{1,2}(?:st|nd|rd|th)?\s+' + month_pat + r',?\s+202\d|\d{1,2}[\/.-]\d{1,2}[\/.-]202\d)'
+    for m in re.finditer(p_date, full_corpus, re.IGNORECASE):
+        d = parse_date_str(m.group(1))
+        if d: return d
+
+    # CHIẾN LƯỢC 2: Quét xung quanh mã công văn (ví dụ QT1-HDS-PMB2-L-2349)
+    m_doc = re.search(r'(QT1-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+)', filename or full_corpus)
+    if m_doc:
+        doc_no = m_doc.group(1)
+        for m_ref in re.finditer(re.escape(doc_no), full_corpus):
+            snippet = full_corpus[max(0, m_ref.start() - 250): min(len(full_corpus), m_ref.end() + 250)]
+            clean_snippet = re.sub(r'\bdated\s+[^\n\r,]+', '', snippet, flags=re.IGNORECASE)
+            d = parse_date_str(clean_snippet)
+            if d: return d
+
+    # CHIẾN LƯỢC 3: Loại bỏ khối tham chiếu và quét ngày hợp lệ còn lại
+    cleaned = re.sub(r'Reference\(s\)[\s\S]*?(?=Dear\s+Sir|\Z)', '', full_corpus, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\bdated\s+[^\n\r]+', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\bContract\s+Agreement[^\n\r]+', '', cleaned, flags=re.IGNORECASE)
+    d = parse_date_str(cleaned)
+    if d: return d
 
     return ""
 
@@ -152,100 +203,37 @@ def parse_cover_pdf_bytes(pdf_bytes, filename=""):
         'subject': fn_subject if fn_subject else 'Official Transmittal',
         'docs': {}
     }
-    
-    all_texts = []
+
+    # Bóc tách ngày thông minh qua luồng nhị phân
+    found_date = universal_pdf_date_extractor(pdf_bytes, filename)
+    if found_date:
+        metadata['date_str'] = found_date
+
+    # Bóc tách Ref và Subject
     try:
         reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
-        for page in reader.pages:
-            try:
-                t = page.extract_text()
-                if t: all_texts.append(t)
-            except Exception:
-                pass
-
-            # Trích xuất sâu từ luồng dữ liệu thô (Content Streams)
-            try:
-                contents = page.get("/Contents")
-                if contents:
-                    if not isinstance(contents, list):
-                        contents = [contents]
-                    for c in contents:
-                        c_obj = c.get_object()
-                        if hasattr(c_obj, "get_data"):
-                            raw_data = c_obj.get_data().decode('latin1', errors='ignore')
-                            strings_in_stream = re.findall(r'\(([^)]+)\)', raw_data)
-                            if strings_in_stream:
-                                all_texts.append(" ".join(strings_in_stream))
-                            all_texts.append(raw_data)
-            except Exception:
-                pass
-
-            # Trích xuất từ Form XObjects
-            try:
-                res = page.get("/Resources")
-                if res and "/XObject" in res:
-                    xobjs = res["/XObject"].get_object()
-                    for k in xobjs:
-                        xo = xobjs[k].get_object()
-                        if hasattr(xo, "get_data"):
-                            raw_data = xo.get_data().decode('latin1', errors='ignore')
-                            strings_in_stream = re.findall(r'\(([^)]+)\)', raw_data)
-                            if strings_in_stream:
-                                all_texts.append(" ".join(strings_in_stream))
-                            all_texts.append(raw_data)
-            except Exception:
-                pass
-
-            # Trích xuất từ chú thích (Annotations)
-            try:
-                annots = page.get("/Annots")
-                if annots:
-                    for a in annots:
-                        ao = a.get_object()
-                        for key in ["/Contents", "/V", "/TU"]:
-                            if key in ao:
-                                all_texts.append(str(ao[key]))
-                        if "/AP" in ao:
-                            ap = ao["/AP"].get_object()
-                            for s_key in ap:
-                                s = ap[s_key].get_object()
-                                if hasattr(s, "get_data"):
-                                    raw_data = s.get_data().decode('latin1', errors='ignore')
-                                    strings_in_stream = re.findall(r'\(([^)]+)\)', raw_data)
-                                    if strings_in_stream:
-                                        all_texts.append(" ".join(strings_in_stream))
-                                    all_texts.append(raw_data)
-            except Exception:
-                pass
-    except Exception as e:
-        print(f"Lỗi đọc PDF: {e}")
-
-    full_extracted = "\n".join(all_texts)
-
-    if full_extracted:
+        p1_txt = reader.pages[0].extract_text() or ""
         ref_patterns = [
             r'(?:Ref\.?\s*(?:No\.?)?|Letter\s*(?:No\.?)?|TR\.?\s*(?:No\.?)?|Transmittal\s*(?:No\.?)?|No\.?)\s*[:\s]*([A-Za-z0-9_-]*QT1[A-Za-z0-9_-]+)',
             r'(QT1-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+-\d+)',
             r'(QT1-[A-Za-z0-9_-]+)'
         ]
         for pat in ref_patterns:
-            tr_m = re.search(pat, full_extracted, re.IGNORECASE)
+            tr_m = re.search(pat, p1_txt, re.IGNORECASE)
             if tr_m:
                 found_ref = tr_m.group(1).strip()
                 if len(found_ref) >= 8 and "EVNPMB2" not in found_ref:
                     metadata['tr_no'] = found_ref
                     break
-        
-        extracted_date = extract_ironclad_date(full_extracted, metadata['tr_no'])
-        if extracted_date:
-            metadata['date_str'] = extracted_date
 
-        subj_m = re.search(r'(?:SUBJECT|Subject|Sub|V/v)\s*[:\s]+([^\n\r]+)', full_extracted)
+        subj_m = re.search(r'(?:SUBJECT|Subject|Sub|V/v)\s*[:\s]+([^\n\r]+)', p1_txt)
         if subj_m:
             raw_subj = subj_m.group(1).strip()
             raw_subj = re.split(r'(?:Document/Drawing|Attachment|Attn:|Dear|Reference)', raw_subj, flags=re.IGNORECASE)[0].strip()
             if len(raw_subj) >= 5:
                 metadata['subject'] = raw_subj
+    except Exception:
+        pass
 
     if (not metadata['tr_no'] or metadata['tr_no'] == 'QT1-Letter') and fn_doc_no:
         metadata['tr_no'] = fn_doc_no
@@ -385,6 +373,7 @@ async def export_zip_full(
                 cover_data = parse_cover_excel_bytes(cover_bytes, cover_file.filename)
             del cover_bytes
 
+        # Ưu tiên nếu có gõ ngày trực tiếp từ giao diện web
         if custom_date and custom_date.strip():
             cover_data['date_str'] = custom_date.strip()
 
