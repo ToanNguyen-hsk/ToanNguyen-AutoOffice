@@ -1,23 +1,27 @@
 from fastapi import FastAPI, UploadFile, File, Form, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 import openpyxl
 from openpyxl.styles import Font
 from copy import copy
 from docx import Document
 from docx.shared import Pt, Inches, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-import re, io, zipfile, traceback, os, base64
+import re, io, zipfile, traceback, os, base64, gc, tempfile, json
 from datetime import datetime
 import pypdf
 
-app = FastAPI(title="QT1 Doc Control API - Full Header Footer Sync")
+app = FastAPI(title="QT1 Doc Control API - Optimized Engine")
 
+# Cấu hình CORS mở cổng và cho phép Frontend đọc Header phản hồi
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition", "X-Processed-Items"],
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -171,7 +175,6 @@ def replace_value_after_keyword(paragraph, keyword, new_text):
         kw_font = paragraph.runs[0].font
         kw_name, kw_size, kw_bold, kw_italic = kw_font.name, kw_font.size, kw_font.bold, kw_font.italic
         val_font = paragraph.runs[-1].font
-        # Đã sửa lỗi đánh máy val_font.bold tại đây
         val_name, val_size, val_bold, val_italic = val_font.name, val_font.size, val_font.bold, val_font.italic
         
         paragraph.clear()
@@ -185,7 +188,6 @@ def replace_value_after_keyword(paragraph, keyword, new_text):
 def update_date_paragraph(paragraph, new_date_str):
     spaces = "                                "
     val_font = paragraph.runs[-1].font
-    # Đã sửa lỗi đánh máy val_font.bold tại đây
     val_name, val_size, val_bold, val_italic = val_font.name, val_font.size, val_font.bold, val_font.italic
     
     paragraph.clear()
@@ -193,7 +195,6 @@ def update_date_paragraph(paragraph, new_date_str):
     r2 = paragraph.add_run(new_date_str)
     r2.font.name, r2.font.size, r2.font.bold, r2.font.italic = val_name, val_size, val_bold, val_italic
 
-# THUẬT TOÁN ĐỒNG BỘ CHÂN TRANG (FOOTER)
 def sync_footer_content(doc, qti_no, subject):
     new_text = f"{qti_no} {subject}"
     for section in doc.sections:
@@ -219,6 +220,13 @@ def sync_footer_content(doc, qti_no, subject):
                     else:
                         p.text = new_text
 
+def remove_temp_file(path: str):
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception as e:
+        print(f"Lỗi dọn dẹp file tạm {path}: {e}")
+
 @app.post("/api/export-zip-full")
 async def export_zip_full(
     files: list[UploadFile] = File(...),
@@ -227,7 +235,10 @@ async def export_zip_full(
     mode: str = Form("auto_bump"),
     qti_no: str = Form("QTI-PECC1-PMB2-26-10-111")
 ):
-    import json
+    temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    temp_zip_path = temp_zip.name
+    temp_zip.close()
+
     try:
         car_metadata = json.loads(metadata)
         now = datetime.now()
@@ -247,39 +258,37 @@ async def export_zip_full(
                 cover_data = parse_cover_pdf_bytes(cover_bytes)
             elif cover_file.filename.lower().endswith(('.xlsx', '.xls')):
                 cover_data = parse_cover_excel_bytes(cover_bytes)
+            del cover_bytes
 
         vi_template_path = find_template("TV")
         if not vi_template_path: raise FileNotFoundError(f"Vui lòng copy file Word mẫu 'TVÐ1-NÐNLM.docx' vào thư mục: {BASE_DIR}")
         en_template_path = find_template("QTI-PECC1")
         if not en_template_path: raise FileNotFoundError(f"Vui lòng copy file Word mẫu 'QTI-PECC1...docx' vào thư mục: {BASE_DIR}")
 
-        zip_io = io.BytesIO()
         processed_car_list = []
 
-        with zipfile.ZipFile(zip_io, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-            
+        with zipfile.ZipFile(temp_zip_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
             for file in files:
                 try:
                     content = await file.read()
-                    wb = openpyxl.load_workbook(io.BytesIO(content))
-                    
-                    max_r = 1
-                    target_sheet_name = wb.sheetnames[0]
-                    target_idx = 0
-                    for idx, s_name in enumerate(wb.sheetnames):
-                        m = re.search(r'round\s*(\d+)', s_name, re.IGNORECASE)
-                        if m and int(m.group(1)) >= max_r:
-                            max_r = int(m.group(1))
-                            target_sheet_name = s_name
-                            target_idx = idx
-                            
-                    source_ws = wb[target_sheet_name]
-                    car_p = re.search(r'(\d{4}\s*CaRs)', file.filename, re.IGNORECASE)
-                    car_base = car_p.group(1) if car_p else "CaRs"
 
                     if mode == "auto_bump":
+                        wb = openpyxl.load_workbook(io.BytesIO(content))
+                        max_r = 1
+                        target_sheet_name = wb.sheetnames[0]
+                        target_idx = 0
+                        for idx, s_name in enumerate(wb.sheetnames):
+                            m = re.search(r'round\s*(\d+)', s_name, re.IGNORECASE)
+                            if m and int(m.group(1)) >= max_r:
+                                max_r = int(m.group(1))
+                                target_sheet_name = s_name
+                                target_idx = idx
+                                
+                        source_ws = wb[target_sheet_name]
+                        car_p = re.search(r'(\d{4}\s*CaRs)', file.filename, re.IGNORECASE)
+                        car_base = car_p.group(1) if car_p else "CaRs"
+
                         selected_status = car_metadata.get(file.filename, "APP")
-                        old_status_raw = get_latest_status_from_ws(source_ws, max_r)
                         new_r_num = max_r + 1
                         new_ws = wb.copy_worksheet(source_ws)
                         new_ws.title = f"ROUND {new_r_num} CaRs"
@@ -385,6 +394,8 @@ async def export_zip_full(
                         wb.save(excel_out)
                         zip_file.writestr(new_excel_name, excel_out.getvalue())
                         
+                        del wb, excel_out
+
                         processed_car_list.append({
                             'doc_no': final_doc_no,
                             'rev': final_rev,
@@ -395,20 +406,29 @@ async def export_zip_full(
                         })
 
                     else:
+                        wb_ro = openpyxl.load_workbook(io.BytesIO(content), read_only=True)
+                        max_r = 1
+                        target_sheet_name = wb_ro.sheetnames[0]
+                        for s_name in wb_ro.sheetnames:
+                            m = re.search(r'round\s*(\d+)', s_name, re.IGNORECASE)
+                            if m and int(m.group(1)) >= max_r:
+                                max_r = int(m.group(1))
+                                target_sheet_name = s_name
+
+                        source_ws = wb_ro[target_sheet_name]
+                        car_p = re.search(r'(\d{4}\s*CaRs)', file.filename, re.IGNORECASE)
+                        car_base = car_p.group(1) if car_p else "CaRs"
+
                         detected_doc_code = extract_clean_doc_no(file.filename)
                         detected_title = ""
-                        if not detected_doc_code:
-                            for c in range(1, source_ws.max_column + 1):
-                                r4_val = str(source_ws.cell(row=4, column=c).value or "")
-                                extracted = extract_clean_doc_no(r4_val)
-                                if extracted:
-                                    detected_doc_code = extracted
-                                    break
-                        
-                        for c in range(1, source_ws.max_column + 1):
-                            r5_val = str(source_ws.cell(row=5, column=c).value or "").strip()
-                            if r5_val and not detected_title:
-                                detected_title = re.sub(r'_(IFA|APD|IFI|RI|HDEC|Reply).*$', '', r5_val, flags=re.IGNORECASE).strip()
+                        for row in source_ws.iter_rows(min_row=4, max_row=5, values_only=True):
+                            for cell_val in row:
+                                val_str = str(cell_val or "").strip()
+                                if not detected_doc_code:
+                                    extracted = extract_clean_doc_no(val_str)
+                                    if extracted: detected_doc_code = extracted
+                                if val_str and not detected_title:
+                                    detected_title = re.sub(r'_(IFA|APD|IFI|RI|HDEC|Reply).*$', '', val_str, flags=re.IGNORECASE).strip()
 
                         cover_info = cover_data['docs'].get(detected_doc_code, {})
                         final_doc_no = cover_info.get('doc_no', detected_doc_code if detected_doc_code else "QT1-Document")
@@ -420,6 +440,7 @@ async def export_zip_full(
                         if actual_status_raw == "AWC": status_full_text = "APPROVED WITH COMMENTS (AWC)"
                         elif actual_status_raw == "RJ": status_full_text = "REJECTED (RJ)"
 
+                        del wb_ro
                         zip_file.writestr(clean_safe_filename(file.filename), content)
                         
                         processed_car_list.append({
@@ -431,17 +452,17 @@ async def export_zip_full(
                             'assigned_car_name': file.filename
                         })
 
+                    del content
+                    gc.collect()
+
                 except Exception as fe:
                     print(f"Lỗi xử lý file {file.filename}: {fe}")
                     traceback.print_exc()
 
             safe_subj_name = clean_safe_filename(cover_data['subject'])
 
-            # =========================================================================
-            # 2. XỬ LÝ TỜ TRÌNH TIẾNG VIỆT
-            # =========================================================================
+            # Tạo Tờ trình Tiếng Việt
             doc_vi = Document(vi_template_path)
-            
             for tbl in doc_vi.tables:
                 for row in tbl.rows:
                     for cell in row.cells:
@@ -462,12 +483,10 @@ async def export_zip_full(
             vi_io = io.BytesIO()
             doc_vi.save(vi_io)
             zip_file.writestr(f"TVÐ1-NÐNLM {safe_subj_name}.docx", vi_io.getvalue())
+            del vi_io, doc_vi
 
-            # =========================================================================
-            # 3. XỬ LÝ THƯ TIẾNG ANH VỚI TÊN FILE VÀ CHÂN TRANG ĐỒNG BỘ
-            # =========================================================================
+            # Tạo Thư Tiếng Anh
             doc_en = Document(en_template_path)
-            
             for tbl in doc_en.tables:
                 for row in tbl.rows:
                     for cell in row.cells:
@@ -510,7 +529,6 @@ async def export_zip_full(
                 for item in reversed(processed_car_list):
                     new_p = target_p.insert_paragraph_before("")
                     new_p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-                    
                     new_p.paragraph_format.left_indent = Inches(0.35)
                     new_p.paragraph_format.first_line_indent = Inches(-0.35)
                     new_p.paragraph_format.space_before = 0
@@ -522,25 +540,47 @@ async def export_zip_full(
 
             en_io = io.BytesIO()
             doc_en.save(en_io)
-            
             safe_qti_name = clean_safe_filename(qti_no)
             zip_file.writestr(f"{safe_qti_name} {safe_subj_name}.docx", en_io.getvalue())
+            del en_io, doc_en
 
-        zip_io.seek(0)
-        zip_base64 = base64.b64encode(zip_io.getvalue()).decode('utf-8')
+            # Tạo file Text tổng hợp kết quả bên trong file ZIP
+            summary_txt = "DANH SÁCH BỘ HỒ SƠ ĐÃ XUẤT:\n" + "="*50 + "\n"
+            for item in processed_car_list:
+                summary_txt += f"• [{item['status']}] {item['doc_no']} Rev.{item['rev']}: {item['title']}\n  File đính kèm: {item['assigned_car_name']}\n\n"
+            zip_file.writestr("00_TONG_HOP_KET_QUA.txt", summary_txt.encode('utf-8'))
+
+        safe_qti_name = clean_safe_filename(qti_no)
+        headers = {
+            "Content-Disposition": f'attachment; filename="{safe_qti_name}.zip"'
+        }
         
-        return {
-            "status": "success",
-            "zip_base64": zip_base64,
-            "processed_items": [
+        # Đóng gói danh sách kết quả qua Header nếu kích thước vừa vặn
+        try:
+            items_json = json.dumps([
                 {
                     "doc_no": item['doc_no'],
                     "assigned_car": item['assigned_car_name'],
                     "status": item['status']
                 } for item in processed_car_list
-            ]
-        }
+            ], ensure_ascii=False)
+            items_b64 = base64.b64encode(items_json.encode('utf-8')).decode('ascii')
+            if len(items_b64) < 6000:
+                headers["X-Processed-Items"] = items_b64
+        except Exception:
+            pass
+
+        # Trả luồng nhị phân trực tiếp từ đĩa tạm, tự động xóa file tạm sau khi gửi xong
+        return FileResponse(
+            path=temp_zip_path,
+            media_type="application/zip",
+            filename=f"{safe_qti_name}.zip",
+            headers=headers,
+            background=BackgroundTask(remove_temp_file, temp_zip_path)
+        )
+
     except Exception as ge:
+        remove_temp_file(temp_zip_path)
         print("Lỗi hệ thống:", ge)
         traceback.print_exc()
         return Response(content=f"Error: {str(ge)}", status_code=400)
