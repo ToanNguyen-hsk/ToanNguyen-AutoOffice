@@ -34,18 +34,23 @@ def normalize_doc_code(raw: str) -> str:
     m = re.search(r'(QT1-[A-Za-z0-9_-]+)', raw)
     if not m: return ""
     code = m.group(1).strip()
-    # Loại bỏ sạch hậu tố _1, _A, _B, _01, rev.1, etc.
     code = re.sub(r'_(?:[A-Za-z0-9]{1,3}|Rev\.?[A-Za-z0-9]+)$', '', code, flags=re.IGNORECASE)
     code = re.sub(r'[\s_]+rev\.?.*$', '', code, flags=re.IGNORECASE)
     return code
 
+def clean_document_title(raw_title: str) -> str:
+    if not raw_title: return ""
+    t = raw_title.strip()
+    t = re.sub(r'\s*\([A-Za-z0-9\s,.~-]*(?:APD|IFA|IFI|AB|RJ|Rev\.?|R\d)[A-Za-z0-9\s,.~-]*\)$', '', t, flags=re.IGNORECASE).strip()
+    t = re.sub(r'VoltageTransformer', 'Voltage Transformer', t, flags=re.IGNORECASE)
+    return t
+
 def extract_title_from_car_filename(filename: str) -> str:
     s = os.path.splitext(filename)[0].strip()
-    # Loại bỏ tiền tố số CaR và ngày: e.g. "2988 CaRs R4 14Aug2024", "4734 CaRs R4"
     s = re.sub(r'^(?:\d+|00xx|xxxx|Xxxx)\s*CaRs?\s*R\d+\s*(?:\d{1,2}[A-Za-z]{3}\d{4}\s*)?', '', s, flags=re.IGNORECASE).strip()
     s = re.sub(r'^(?:QT1-[A-Za-z0-9_-]+)\s*', '', s, flags=re.IGNORECASE).strip()
     s = re.sub(r'[-_](?:reply|comments?|rev\.?[A-Za-z0-9]+)$', '', s, flags=re.IGNORECASE).strip()
-    return s
+    return clean_document_title(s)
 
 def extract_cover_date_bulletproof(text: str) -> str:
     month_map = {
@@ -91,16 +96,34 @@ def extract_cover_date_bulletproof(text: str) -> str:
     return ""
 
 def extract_cover_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
-    all_texts = []
+    all_reconstructed_lines = []
+    full_text_simple = []
+    
     try:
         reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
         for p in reader.pages:
             t = p.extract_text()
-            if t: all_texts.append(t)
+            if t: full_text_simple.append(t)
+            
+            # Quét tọa độ 2D để ghép hàng bảng biểu chuẩn 100%
+            lines_by_y = {}
+            def visitor_body(text, cm, tm, fontDict, fontSize):
+                if text and text.strip():
+                    y = round(tm[5] / 3.0) * 3.0
+                    lines_by_y.setdefault(y, []).append((tm[4], text.strip()))
+            
+            try:
+                p.extract_text(visitor_text=visitor_body)
+                for y in sorted(lines_by_y.keys(), reverse=True):
+                    row_parts = [item[1] for item in sorted(lines_by_y[y], key=lambda x: x[0])]
+                    line_str = " ".join(row_parts)
+                    all_reconstructed_lines.append(line_str)
+            except Exception:
+                pass
     except Exception as e:
         print(f"pypdf error: {e}")
         
-    full_text = "\n".join(all_texts)
+    full_text = "\n".join(full_text_simple)
 
     tr_no = ""
     m_fn = re.search(r'(QT1-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+)', filename)
@@ -125,9 +148,12 @@ def extract_cover_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
     if not subject:
         subject = "Official Transmittal"
 
+    # Kết hợp cả 2 luồng dòng để không bỏ sót bất kỳ bản vẽ nào
+    all_lines_to_check = all_reconstructed_lines + full_text.splitlines()
     docs = {}
     purpose_markers = {'IFA', 'IFI', 'APD', 'AB', 'RI', 'END', '- END -', '-END-', '-'}
-    for line in full_text.splitlines():
+    
+    for line in all_lines_to_check:
         m_doc = re.search(r'(QT1-[0-9L]-[A-Za-z0-9_-]+)', line)
         if m_doc and "EVNPMB2" not in m_doc.group(1) and "QT1-HDH" not in m_doc.group(1):
             raw_code = m_doc.group(1).strip()
@@ -151,11 +177,10 @@ def extract_cover_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
                 rev = m_r.group(1)
                 words.pop(0)
                 
-            title = " ".join(words).strip()
-            title = re.sub(r'VoltageTransformer', 'Voltage Transformer', title, flags=re.IGNORECASE)
+            raw_t = " ".join(words).strip()
+            title = clean_document_title(raw_t)
             
-            # Chỉ lưu khi title có dữ liệu thực tế
-            if norm_code:
+            if norm_code and title and title.lower() != subject.lower():
                 docs[norm_code] = {
                     'doc_no': norm_code,
                     'rev': rev,
@@ -393,7 +418,7 @@ async def export_zip_full(
                         if m and 'QT1-HDH' not in val:
                             doc_no = normalize_doc_code(m.group(1))
                             rev_val = str(ws_t.cell(row=r, column=c+1).value or "1").strip()
-                            title_val = str(ws_t.cell(row=r, column=c+2).value or "").strip()
+                            title_val = clean_document_title(str(ws_t.cell(row=r, column=c+2).value or "").strip())
                             cover_data['docs'][doc_no] = {'doc_no': doc_no, 'rev': rev_val, 'title': title_val}
             del cover_bytes
 
@@ -542,27 +567,31 @@ async def export_zip_full(
                             elif found_rj: detected_status_raw = "REJECTED (RJ)"
                             else: detected_status_raw = "APPROVED (APP)"
 
-                            # BÓC TÁCH MÃ BẢN VẼ
+                            # Quét tìm Doc No chính xác từ hàng 4 (duyệt mọi cột để không sót)
                             detected_doc_code = ""
-                            r4_val = str(target_ws.cell(row=4, column=com_col).value or "")
-                            if r4_val:
-                                detected_doc_code = normalize_doc_code(r4_val)
+                            for c in range(1, target_ws.max_column + 1):
+                                v_c = str(target_ws.cell(row=4, column=c).value or "")
+                                if "QT1-" in v_c:
+                                    detected_doc_code = normalize_doc_code(v_c)
+                                    break
                             if not detected_doc_code:
                                 detected_doc_code = normalize_doc_code(file.filename)
 
-                            # Khớp mã với Transmittal Cover
                             cover_info = cover_data['docs'].get(detected_doc_code, {})
                             final_doc_no = cover_info.get('doc_no', detected_doc_code if detected_doc_code else "QT1-Document")
                             final_rev = cover_info.get('rev', '1')
 
-                            # BẢO VỆ TÊN TÀI LIỆU 3 TẦNG (TUYỆT ĐỐI KHÔNG BỊ TRÀN SUBJECT)
-                            r5_val = str(target_ws.cell(row=5, column=com_col).value or "").strip()
-                            if r5_val.lower() in ['iv', 'v', 'title of document', '']: r5_val = ""
-                            r5_val = re.sub(r'\s*\(Rev\.\s*[A-Za-z0-9]+\)', '', r5_val, flags=re.IGNORECASE).strip()
+                            # Lấy tên tài liệu: Ưu tiên số 1 là Cover, nếu không có thì lấy tên tại ô G5 đã làm sạch
+                            r5_val = ""
+                            for c in range(1, target_ws.max_column + 1):
+                                v_r5 = str(target_ws.cell(row=5, column=c).value or "").strip()
+                                if v_r5 and v_r5.lower() not in ['iv', 'v', 'title of document']:
+                                    r5_val = clean_document_title(v_r5)
+                                    break
 
                             title_from_fn = extract_title_from_car_filename(file.filename)
 
-                            if cover_info.get('title') and cover_info['title'] != cover_data['subject']:
+                            if cover_info.get('title') and cover_info['title'].lower() != cover_data['subject'].lower():
                                 final_title = cover_info['title']
                             elif r5_val:
                                 final_title = r5_val
@@ -570,8 +599,6 @@ async def export_zip_full(
                                 final_title = title_from_fn
                             else:
                                 final_title = cover_data['subject']
-
-                            final_title = re.sub(r'VoltageTransformer', 'Voltage Transformer', final_title, flags=re.IGNORECASE)
 
                             # Cấp số CaR vào ô E1 (Xóa bỏ hoàn toàn màu nền bôi vàng)
                             red_title_font = Font(name="Times New Roman", size=16, bold=True, color="FFFF0000")
@@ -653,32 +680,38 @@ async def export_zip_full(
                             new_com_col = (prev_rep_col + 1) if prev_rep_col else (new_ws.max_column + 1)
                             new_rep_col = new_com_col + 2
 
-                            # BÓC TÁCH MÃ DOC TỪ SHEET CŨ
+                            # Quét mã tài liệu từ hàng 4 (quét toàn bộ các cột để đảm bảo không bị lệch)
                             detected_doc_code = ""
-                            r4_val = str(source_ws.cell(row=4, column=prev_com_col).value or "")
-                            if r4_val:
-                                detected_doc_code = normalize_doc_code(r4_val)
+                            r4_val = ""
+                            for c in range(1, source_ws.max_column + 1):
+                                v_c = str(source_ws.cell(row=4, column=c).value or "")
+                                if "QT1-" in v_c:
+                                    detected_doc_code = normalize_doc_code(v_c)
+                                    r4_val = v_c
+                                    break
                             if not detected_doc_code:
                                 detected_doc_code = normalize_doc_code(file.filename)
 
                             cover_info = cover_data['docs'].get(detected_doc_code, {})
                             final_doc_no = cover_info.get('doc_no', detected_doc_code if detected_doc_code else "QT1-Document")
                             
-                            # Lấy Rev mới: ưu tiên Transmittal, nếu không có thì lấy Rev cũ của file
                             if cover_info.get('rev'):
                                 final_rev = cover_info['rev']
                             else:
                                 m_rev = re.search(r'rev\.?\s*([A-Za-z0-9]+)', r4_val, re.IGNORECASE)
                                 final_rev = m_rev.group(1) if m_rev else "1"
 
-                            # BẢO VỆ TÊN TÀI LIỆU 3 TẦNG:
-                            r5_val = str(source_ws.cell(row=5, column=prev_com_col).value or "").strip()
-                            if r5_val.lower() in ['iv', 'v', 'title of document', '']: r5_val = ""
-                            r5_val = re.sub(r'\s*\(Rev\.\s*[A-Za-z0-9]+\)', '', r5_val, flags=re.IGNORECASE).strip()
+                            # Lấy tên tài liệu chuẩn xác: Ưu tiên số 1 là Cover Transmittal
+                            r5_val = ""
+                            for c in range(1, source_ws.max_column + 1):
+                                v_r5 = str(source_ws.cell(row=5, column=c).value or "").strip()
+                                if v_r5 and v_r5.lower() not in ['iv', 'v', 'title of document']:
+                                    r5_val = clean_document_title(v_r5)
+                                    break
 
                             title_from_fn = extract_title_from_car_filename(file.filename)
 
-                            if cover_info.get('title') and cover_info['title'] != cover_data['subject']:
+                            if cover_info.get('title') and cover_info['title'].lower() != cover_data['subject'].lower():
                                 final_title = cover_info['title']
                             elif r5_val:
                                 final_title = r5_val
@@ -687,7 +720,6 @@ async def export_zip_full(
                             else:
                                 final_title = cover_data['subject']
 
-                            # Cập nhật số CaR tại ô E1
                             for c in range(2, 10):
                                 v = str(new_ws.cell(row=1, column=c).value or "")
                                 if re.search(r'-\s*R\d+', v, re.IGNORECASE) or (c == 5 and v):
@@ -717,7 +749,6 @@ async def export_zip_full(
                             new_ws.column_dimensions[openpyxl.utils.get_column_letter(new_com_col)].width = 38
                             new_ws.column_dimensions[openpyxl.utils.get_column_letter(new_rep_col)].width = 38
 
-                            # Tối ưu hóa: chỉ duyệt tối đa 100 dòng ý kiến thực tế
                             limit_row = min(new_ws.max_row, 100)
                             for r in range(14, limit_row + 1):
                                 v_prev_c = str(new_ws.cell(row=r, column=prev_com_col).value or "").strip()
@@ -767,7 +798,7 @@ async def export_zip_full(
                             final_doc_no = cover_info.get('doc_no', detected_doc_code if detected_doc_code else "QT1-Document")
                             final_rev = cover_info.get('rev', '1')
 
-                            if cover_info.get('title') and cover_info['title'] != cover_data['subject']:
+                            if cover_info.get('title') and cover_info['title'].lower() != cover_data['subject'].lower():
                                 final_title = cover_info['title']
                             elif title_from_fn:
                                 final_title = title_from_fn
