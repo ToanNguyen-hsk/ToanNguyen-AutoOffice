@@ -1,18 +1,26 @@
-from fastapi import FastAPI, UploadFile, File, Form, Response
+import base64
+from copy import copy
+from datetime import datetime
+import gc
+import io
+import json
+import os
+import re
+import tempfile
+import traceback
+import zipfile
+from docx import Document
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.shared import Inches, Pt, RGBColor
+from fastapi import FastAPI, File, Form, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from starlette.background import BackgroundTask
 import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from copy import copy
-from docx import Document
-from docx.shared import Pt, Inches, RGBColor
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-import re, io, zipfile, traceback, os, base64, gc, tempfile, json
-from datetime import datetime
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 import pypdf
+from starlette.background import BackgroundTask
 
-app = FastAPI(title="QT1 Doc Control API - High Performance Precision Engine")
+app = FastAPI(title="QT1 Doc Control API - Master Deterministic Engine")
 
 app.add_middleware(
     CORSMiddleware,
@@ -31,7 +39,7 @@ def clean_safe_filename(name: str) -> str:
 
 def normalize_doc_code(raw: str) -> str:
     if not raw: return ""
-    m = re.search(r'(QT1-[A-Za-z0-9_-]+)', raw)
+    m = re.search(r'(QT1-[0-9L]-[A-Za-z0-9_-]+)', raw)
     if not m: return ""
     code = m.group(1).strip()
     code = re.sub(r'_(?:[A-Za-z0-9]{1,3}|Rev\.?[A-Za-z0-9]+)$', '', code, flags=re.IGNORECASE)
@@ -40,14 +48,20 @@ def normalize_doc_code(raw: str) -> str:
 
 def clean_document_title(raw_title: str) -> str:
     if not raw_title: return ""
-    t = raw_title.strip()
+    t = str(raw_title).strip()
+    # Loại bỏ chỉ mục số hoặc La Mã bị dính
+    t = re.sub(r'^(?:iv|v|vi|vii|viii|\d{1,2})\s+', '', t, flags=re.IGNORECASE).strip()
+    # Loại bỏ hậu tố trạng thái thừa từ round cũ
     t = re.sub(r'\s*\([A-Za-z0-9\s,.~-]*(?:APD|IFA|IFI|AB|RJ|Rev\.?|R\d)[A-Za-z0-9\s,.~-]*\)$', '', t, flags=re.IGNORECASE).strip()
     t = re.sub(r'VoltageTransformer', 'Voltage Transformer', t, flags=re.IGNORECASE)
+    # Nếu chỉ còn lại 1 con số đơn độc hoặc chữ La Mã thì hủy giá trị rác
+    if re.match(r'^(?:iv|v|vi|\d{1,2})$', t, re.IGNORECASE):
+        return ""
     return t
 
-def extract_title_from_car_filename(filename: str) -> str:
+def extract_title_from_filename(filename: str) -> str:
     s = os.path.splitext(filename)[0].strip()
-    s = re.sub(r'^(?:\d+|00xx|xxxx|Xxxx)\s*CaRs?\s*R\d+\s*(?:\d{1,2}[A-Za-z]{3}\d{4}\s*)?', '', s, flags=re.IGNORECASE).strip()
+    s = re.sub(r'^(?:\d+|00xx|xxxx|Xxxx)\s*CaRs?\s*R\d+\s*(?:\d{1,2}\s*[A-Za-z]{3}\s*\d{4}\s*)?', '', s, flags=re.IGNORECASE).strip()
     s = re.sub(r'^(?:QT1-[A-Za-z0-9_-]+)\s*', '', s, flags=re.IGNORECASE).strip()
     s = re.sub(r'[-_](?:reply|comments?|rev\.?[A-Za-z0-9]+)$', '', s, flags=re.IGNORECASE).strip()
     return clean_document_title(s)
@@ -96,35 +110,21 @@ def extract_cover_date_bulletproof(text: str) -> str:
     return ""
 
 def extract_cover_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
-    all_reconstructed_lines = []
-    full_text_simple = []
+    docs = {}
+    full_text_pages = []
     
     try:
         reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
-        for p in reader.pages:
-            t = p.extract_text()
-            if t: full_text_simple.append(t)
-            
-            # Quét tọa độ 2D để ghép hàng bảng biểu chuẩn 100%
-            lines_by_y = {}
-            def visitor_body(text, cm, tm, fontDict, fontSize):
-                if text and text.strip():
-                    y = round(tm[5] / 3.0) * 3.0
-                    lines_by_y.setdefault(y, []).append((tm[4], text.strip()))
-            
-            try:
-                p.extract_text(visitor_text=visitor_body)
-                for y in sorted(lines_by_y.keys(), reverse=True):
-                    row_parts = [item[1] for item in sorted(lines_by_y[y], key=lambda x: x[0])]
-                    line_str = " ".join(row_parts)
-                    all_reconstructed_lines.append(line_str)
-            except Exception:
-                pass
+        for page in reader.pages:
+            t = page.extract_text()
+            if t:
+                full_text_pages.append(t)
     except Exception as e:
-        print(f"pypdf error: {e}")
+        print(f"pypdf reader error: {e}")
         
-    full_text = "\n".join(full_text_simple)
+    full_text = "\n".join(full_text_pages)
 
+    # 1. Trích xuất Ref No
     tr_no = ""
     m_fn = re.search(r'(QT1-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+)', filename)
     if m_fn:
@@ -136,24 +136,26 @@ def extract_cover_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
     if not tr_no:
         tr_no = "QT1-Transmittal"
 
+    # 2. Ngày công văn
     date_str = extract_cover_date_bulletproof(full_text)
 
+    # 3. Trích xuất Subject
     subject = ""
     m_sub = re.search(r'(?:SUBJECT|Subject)\s*[:\s]+([^\n\r]+)', full_text, re.IGNORECASE)
     if m_sub:
         raw_sub = m_sub.group(1).strip()
         raw_sub = re.split(r'(?:Reference|Dear|Attn|Attachment|Document/Drawing|Sheet:)', raw_sub, flags=re.IGNORECASE)[0].strip()
         subject = raw_sub
-
     if not subject:
         subject = "Official Transmittal"
 
-    # Kết hợp cả 2 luồng dòng để không bỏ sót bất kỳ bản vẽ nào
-    all_lines_to_check = all_reconstructed_lines + full_text.splitlines()
-    docs = {}
+    # 4. Thuật toán phân tích bảng Transmittal hỗ trợ đa trang và tiêu đề ngắt dòng
+    lines = full_text.splitlines()
     purpose_markers = {'IFA', 'IFI', 'APD', 'AB', 'RI', 'END', '- END -', '-END-', '-'}
     
-    for line in all_lines_to_check:
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
         m_doc = re.search(r'(QT1-[0-9L]-[A-Za-z0-9_-]+)', line)
         if m_doc and "EVNPMB2" not in m_doc.group(1) and "QT1-HDH" not in m_doc.group(1):
             raw_code = m_doc.group(1).strip()
@@ -161,6 +163,7 @@ def extract_cover_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
             after = line[m_doc.end():].strip()
             
             words = after.split()
+            # Bỏ các nhãn trạng thái ở cuối dòng
             while words and words[-1].upper() in purpose_markers:
                 words.pop()
             while words and words[-1] in ['-', 'END']:
@@ -177,15 +180,32 @@ def extract_cover_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
                 rev = m_r.group(1)
                 words.pop(0)
                 
-            raw_t = " ".join(words).strip()
-            title = clean_document_title(raw_t)
+            title_parts = [ " ".join(words).strip() ]
             
-            if norm_code and title and title.lower() != subject.lower():
+            # Quét gom các dòng kế tiếp nếu tiêu đề bị ngắt dòng trong ô bảng tính
+            j = i + 1
+            while j < len(lines):
+                next_line = lines[j].strip()
+                # Dừng nếu gặp mục mới hoặc hết bảng
+                if re.search(r'(QT1-[0-9L]-[A-Za-z0-9_-]+)', next_line) or re.match(r'^\d{1,2}\s+', next_line) or "Purpose:" in next_line:
+                    break
+                if next_line and not any(k in next_line for k in ["Sheet:", "Date:", "Page", "END -"]):
+                    # Lược bỏ các từ cột Purpose ở dòng tiếp theo
+                    clean_next = " ".join([w for w in next_line.split() if w.upper() not in purpose_markers])
+                    if clean_next:
+                        title_parts.append(clean_next)
+                j += 1
+                
+            combined_title = " ".join(title_parts).strip()
+            combined_title = clean_document_title(combined_title)
+            
+            if norm_code and combined_title:
                 docs[norm_code] = {
                     'doc_no': norm_code,
                     'rev': rev,
-                    'title': title
+                    'title': combined_title
                 }
+        i += 1
 
     return {
         'tr_no': tr_no,
@@ -440,7 +460,7 @@ async def export_zip_full(
         with zipfile.ZipFile(temp_zip_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
             
             # =========================================================================
-            # LỰA CHỌN 1: TỰ ĐỘNG TẠO CAR TỪ THƯ COVER (KHÔNG CẦN NẠP FILE CAR)
+            # LỰA CHỌN 1: TỰ ĐỘNG TẠO CAR TỪ THƯ COVER
             # =========================================================================
             if mode == "auto_generate_cars":
                 docs_to_generate = []
@@ -512,7 +532,7 @@ async def export_zip_full(
                     })
 
             # =========================================================================
-            # CÁC LỰA CHỌN CÓ NẠP FILE CAR (2, 3, 4) - BẢO VỆ TÊN TÀI LIỆU TUYỆT ĐỐI
+            # CÁC LỰA CHỌN CÓ NẠP FILE CAR (2, 3, 4)
             # =========================================================================
             elif mode != "no_car_letter" and files:
                 for file_idx, file in enumerate(files):
@@ -567,12 +587,14 @@ async def export_zip_full(
                             elif found_rj: detected_status_raw = "REJECTED (RJ)"
                             else: detected_status_raw = "APPROVED (APP)"
 
-                            # Quét tìm Doc No chính xác từ hàng 4 (duyệt mọi cột để không sót)
+                            # Bóc tách mã bản vẽ từ hàng 4 (bỏ qua cột A, B)
                             detected_doc_code = ""
-                            for c in range(1, target_ws.max_column + 1):
+                            r4_val = ""
+                            for c in range(3, target_ws.max_column + 1):
                                 v_c = str(target_ws.cell(row=4, column=c).value or "")
                                 if "QT1-" in v_c:
                                     detected_doc_code = normalize_doc_code(v_c)
+                                    r4_val = v_c
                                     break
                             if not detected_doc_code:
                                 detected_doc_code = normalize_doc_code(file.filename)
@@ -581,22 +603,27 @@ async def export_zip_full(
                             final_doc_no = cover_info.get('doc_no', detected_doc_code if detected_doc_code else "QT1-Document")
                             final_rev = cover_info.get('rev', '1')
 
-                            # Lấy tên tài liệu: Ưu tiên số 1 là Cover, nếu không có thì lấy tên tại ô G5 đã làm sạch
+                            # Lấy tên tài liệu: Tuyệt đối không đọc cột A và B
                             r5_val = ""
-                            for c in range(1, target_ws.max_column + 1):
-                                v_r5 = str(target_ws.cell(row=5, column=c).value or "").strip()
-                                if v_r5 and v_r5.lower() not in ['iv', 'v', 'title of document']:
-                                    r5_val = clean_document_title(v_r5)
-                                    break
+                            v_com = str(target_ws.cell(row=5, column=com_col).value or "").strip()
+                            if v_com:
+                                r5_val = clean_document_title(v_com)
+                            if not r5_val:
+                                for c in range(6, target_ws.max_column + 1):
+                                    v_c5 = str(target_ws.cell(row=5, column=c).value or "").strip()
+                                    cleaned = clean_document_title(v_c5)
+                                    if cleaned:
+                                        r5_val = cleaned
+                                        break
 
-                            title_from_fn = extract_title_from_car_filename(file.filename)
+                            title_from_fn = extract_title_from_filename(file.filename)
 
                             if cover_info.get('title') and cover_info['title'].lower() != cover_data['subject'].lower():
                                 final_title = cover_info['title']
-                            elif r5_val:
-                                final_title = r5_val
                             elif title_from_fn:
                                 final_title = title_from_fn
+                            elif r5_val:
+                                final_title = r5_val
                             else:
                                 final_title = cover_data['subject']
 
@@ -680,15 +707,18 @@ async def export_zip_full(
                             new_com_col = (prev_rep_col + 1) if prev_rep_col else (new_ws.max_column + 1)
                             new_rep_col = new_com_col + 2
 
-                            # Quét mã tài liệu từ hàng 4 (quét toàn bộ các cột để đảm bảo không bị lệch)
+                            # Lấy mã Doc No từ ô hàng 4 của cột nhận xét trước đó
                             detected_doc_code = ""
-                            r4_val = ""
-                            for c in range(1, source_ws.max_column + 1):
-                                v_c = str(source_ws.cell(row=4, column=c).value or "")
-                                if "QT1-" in v_c:
-                                    detected_doc_code = normalize_doc_code(v_c)
-                                    r4_val = v_c
-                                    break
+                            r4_val = str(source_ws.cell(row=4, column=prev_com_col).value or "")
+                            if r4_val:
+                                detected_doc_code = normalize_doc_code(r4_val)
+                            if not detected_doc_code:
+                                for c in range(3, source_ws.max_column + 1):
+                                    v_c = str(source_ws.cell(row=4, column=c).value or "")
+                                    if "QT1-" in v_c:
+                                        detected_doc_code = normalize_doc_code(v_c)
+                                        r4_val = v_c
+                                        break
                             if not detected_doc_code:
                                 detected_doc_code = normalize_doc_code(file.filename)
 
@@ -701,25 +731,32 @@ async def export_zip_full(
                                 m_rev = re.search(r'rev\.?\s*([A-Za-z0-9]+)', r4_val, re.IGNORECASE)
                                 final_rev = m_rev.group(1) if m_rev else "1"
 
-                            # Lấy tên tài liệu chuẩn xác: Ưu tiên số 1 là Cover Transmittal
+                            # Lấy tiêu đề: Bỏ qua hoàn toàn cột A, B. Đọc trực tiếp từ cột prev_com_col
                             r5_val = ""
-                            for c in range(1, source_ws.max_column + 1):
-                                v_r5 = str(source_ws.cell(row=5, column=c).value or "").strip()
-                                if v_r5 and v_r5.lower() not in ['iv', 'v', 'title of document']:
-                                    r5_val = clean_document_title(v_r5)
-                                    break
+                            v_prev5 = str(source_ws.cell(row=5, column=prev_com_col).value or "").strip()
+                            if v_prev5:
+                                r5_val = clean_document_title(v_prev5)
+                            if not r5_val:
+                                for c in range(6, source_ws.max_column + 1):
+                                    v_c5 = str(source_ws.cell(row=5, column=c).value or "").strip()
+                                    cleaned = clean_document_title(v_c5)
+                                    if cleaned:
+                                        r5_val = cleaned
+                                        break
 
-                            title_from_fn = extract_title_from_car_filename(file.filename)
+                            title_from_fn = extract_title_from_filename(file.filename)
 
+                            # Phân cấp lấy tiêu đề chuẩn xác
                             if cover_info.get('title') and cover_info['title'].lower() != cover_data['subject'].lower():
                                 final_title = cover_info['title']
-                            elif r5_val:
-                                final_title = r5_val
                             elif title_from_fn:
                                 final_title = title_from_fn
+                            elif r5_val:
+                                final_title = r5_val
                             else:
                                 final_title = cover_data['subject']
 
+                            # Cập nhật số CaR tại ô E1
                             for c in range(2, 10):
                                 v = str(new_ws.cell(row=1, column=c).value or "")
                                 if re.search(r'-\s*R\d+', v, re.IGNORECASE) or (c == 5 and v):
@@ -792,7 +829,7 @@ async def export_zip_full(
                             car_base = car_p.group(1) if car_p else "CaRs"
 
                             detected_doc_code = normalize_doc_code(file.filename)
-                            title_from_fn = extract_title_from_car_filename(file.filename)
+                            title_from_fn = extract_title_from_filename(file.filename)
 
                             cover_info = cover_data['docs'].get(detected_doc_code, {})
                             final_doc_no = cover_info.get('doc_no', detected_doc_code if detected_doc_code else "QT1-Document")
