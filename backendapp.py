@@ -20,7 +20,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 import pypdf
 from starlette.background import BackgroundTask
 
-app = FastAPI(title="QT1 Doc Control API - Master Deterministic Engine")
+app = FastAPI(title="QT1 Doc Control API - Master Locked Engine")
 
 app.add_middleware(
     CORSMiddleware,
@@ -33,13 +33,18 @@ app.add_middleware(
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+
+# =========================================================================
+# MODULE 1: BỘ LỌC ĐỊNH DẠNG (ĐÃ KHÓA CỨNG - KHÔNG CHỈNH SỬA)
+# =========================================================================
+
 def clean_safe_filename(name: str) -> str:
     cleaned = re.sub(r'[\\/*?:"<>|]', '-', name).strip()
     return cleaned[:130] if len(cleaned) > 130 else cleaned
 
 def normalize_doc_code(raw: str) -> str:
     if not raw: return ""
-    m = re.search(r'(QT1-[0-9L]-[A-Za-z0-9_-]+)', raw)
+    m = re.search(r'(QT1-[A-Za-z0-9_-]+)', raw)
     if not m: return ""
     code = m.group(1).strip()
     code = re.sub(r'_(?:[A-Za-z0-9]{1,3}|Rev\.?[A-Za-z0-9]+)$', '', code, flags=re.IGNORECASE)
@@ -49,13 +54,13 @@ def normalize_doc_code(raw: str) -> str:
 def clean_document_title(raw_title: str) -> str:
     if not raw_title: return ""
     t = str(raw_title).strip()
-    # Loại bỏ chỉ mục số hoặc La Mã bị dính
-    t = re.sub(r'^(?:iv|v|vi|vii|viii|\d{1,2})\s+', '', t, flags=re.IGNORECASE).strip()
-    # Loại bỏ hậu tố trạng thái thừa từ round cũ
+    # Xóa số chỉ mục La Mã/Số đếm bị dính ở đầu (VD: "iv ", "4 ")
+    t = re.sub(r'^(?:iv|v|vi|vii|viii|ix|x|\d{1,2})\s+', '', t, flags=re.IGNORECASE).strip()
+    # Xóa các cụm trạng thái thừa ở cuối (VD: "(APD, Rev.0)", "(IFA)", "(APD, Rev.1~3)")
     t = re.sub(r'\s*\([A-Za-z0-9\s,.~-]*(?:APD|IFA|IFI|AB|RJ|Rev\.?|R\d)[A-Za-z0-9\s,.~-]*\)$', '', t, flags=re.IGNORECASE).strip()
     t = re.sub(r'VoltageTransformer', 'Voltage Transformer', t, flags=re.IGNORECASE)
-    # Nếu chỉ còn lại 1 con số đơn độc hoặc chữ La Mã thì hủy giá trị rác
-    if re.match(r'^(?:iv|v|vi|\d{1,2})$', t, re.IGNORECASE):
+    # Loại bỏ nếu chỉ còn lại 1 chữ số hoặc 1 mã rác
+    if re.match(r'^(?:iv|v|vi|vii|viii|ix|x|\d{1,2})$', t, re.IGNORECASE):
         return ""
     return t
 
@@ -87,16 +92,14 @@ def extract_cover_date_bulletproof(text: str) -> str:
             d_val = int(g[0] + g[1])
             m_val = int(g[2] + g[3])
             y_val = g[4] + g[5] + g[6] + g[7]
-            if 1 <= m_val <= 12 and 1 <= d_val <= 31:
-                return f"{d_val:02d}/{m_val:02d}/{y_val}"
+            if 1 <= m_val <= 12 and 1 <= d_val <= 31: return f"{d_val:02d}/{m_val:02d}/{y_val}"
 
         m_slash = re.search(r'[:\s-]*\s*(\d{1,2})[\/.-](\d{1,2})[\/.-](202\d)', snippet_clean)
         if m_slash:
             d_val = int(m_slash.group(1))
             m_val = int(m_slash.group(2))
             y_val = m_slash.group(3)
-            if 1 <= m_val <= 12 and 1 <= d_val <= 31:
-                return f"{d_val:02d}/{m_val:02d}/{y_val}"
+            if 1 <= m_val <= 12 and 1 <= d_val <= 31: return f"{d_val:02d}/{m_val:02d}/{y_val}"
 
         collapsed = re.sub(r'\s+', ' ', snippet_clean).strip()
         m_en = re.search(r'\b(' + month_pat + r')\s*(\d{1,2})\s*,?\s*(202\s*\d)', collapsed, re.IGNORECASE)
@@ -104,58 +107,61 @@ def extract_cover_date_bulletproof(text: str) -> str:
             mon_str = m_en.group(1).lower()
             d_val = int(m_en.group(2))
             y_val = re.sub(r'\s+', '', m_en.group(3))
-            if mon_str in month_map and 1 <= d_val <= 31:
-                return f"{d_val:02d}/{month_map[mon_str]:02d}/{y_val}"
+            if mon_str in month_map and 1 <= d_val <= 31: return f"{d_val:02d}/{month_map[mon_str]:02d}/{y_val}"
 
     return ""
 
 def extract_cover_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
-    docs = {}
-    full_text_pages = []
+    all_reconstructed_lines = []
+    full_text_simple = []
     
     try:
         reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
-        for page in reader.pages:
-            t = page.extract_text()
-            if t:
-                full_text_pages.append(t)
+        for p in reader.pages:
+            t = p.extract_text()
+            if t: full_text_simple.append(t)
+            
+            # Quét tọa độ Y để chống ngắt dòng
+            lines_by_y = {}
+            def visitor_body(text, cm, tm, fontDict, fontSize):
+                if text and text.strip():
+                    y = round(tm[5] / 3.0) * 3.0
+                    lines_by_y.setdefault(y, []).append((tm[4], text.strip()))
+            try:
+                p.extract_text(visitor_text=visitor_body)
+                for y in sorted(lines_by_y.keys(), reverse=True):
+                    row_parts = [item[1] for item in sorted(lines_by_y[y], key=lambda x: x[0])]
+                    all_reconstructed_lines.append(" ".join(row_parts))
+            except: pass
     except Exception as e:
         print(f"pypdf reader error: {e}")
         
-    full_text = "\n".join(full_text_pages)
+    full_text = "\n".join(full_text_simple)
 
-    # 1. Trích xuất Ref No
     tr_no = ""
     m_fn = re.search(r'(QT1-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+)', filename)
-    if m_fn:
-        tr_no = m_fn.group(1).strip()
+    if m_fn: tr_no = m_fn.group(1).strip()
     if not tr_no:
         m_ref = re.search(r'(?:TR\.?\s*No\.?|Ref\.?)\s*[:\s]*([A-Za-z0-9_-]*QT1[A-Za-z0-9_-]+)', full_text, re.IGNORECASE)
-        if m_ref and "EVNPMB2" not in m_ref.group(1):
-            tr_no = m_ref.group(1).strip()
-    if not tr_no:
-        tr_no = "QT1-Transmittal"
+        if m_ref and "EVNPMB2" not in m_ref.group(1): tr_no = m_ref.group(1).strip()
+    if not tr_no: tr_no = "QT1-Transmittal"
 
-    # 2. Ngày công văn
     date_str = extract_cover_date_bulletproof(full_text)
 
-    # 3. Trích xuất Subject
     subject = ""
     m_sub = re.search(r'(?:SUBJECT|Subject)\s*[:\s]+([^\n\r]+)', full_text, re.IGNORECASE)
     if m_sub:
         raw_sub = m_sub.group(1).strip()
-        raw_sub = re.split(r'(?:Reference|Dear|Attn|Attachment|Document/Drawing|Sheet:)', raw_sub, flags=re.IGNORECASE)[0].strip()
-        subject = raw_sub
-    if not subject:
-        subject = "Official Transmittal"
+        subject = re.split(r'(?:Reference|Dear|Attn|Attachment|Document/Drawing|Sheet:)', raw_sub, flags=re.IGNORECASE)[0].strip()
+    if not subject: subject = "Official Transmittal"
 
-    # 4. Thuật toán phân tích bảng Transmittal hỗ trợ đa trang và tiêu đề ngắt dòng
-    lines = full_text.splitlines()
+    all_lines_to_check = all_reconstructed_lines + full_text.splitlines()
+    docs = {}
     purpose_markers = {'IFA', 'IFI', 'APD', 'AB', 'RI', 'END', '- END -', '-END-', '-'}
     
     i = 0
-    while i < len(lines):
-        line = lines[i].strip()
+    while i < len(all_lines_to_check):
+        line = all_lines_to_check[i].strip()
         m_doc = re.search(r'(QT1-[0-9L]-[A-Za-z0-9_-]+)', line)
         if m_doc and "EVNPMB2" not in m_doc.group(1) and "QT1-HDH" not in m_doc.group(1):
             raw_code = m_doc.group(1).strip()
@@ -163,11 +169,8 @@ def extract_cover_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
             after = line[m_doc.end():].strip()
             
             words = after.split()
-            # Bỏ các nhãn trạng thái ở cuối dòng
-            while words and words[-1].upper() in purpose_markers:
-                words.pop()
-            while words and words[-1] in ['-', 'END']:
-                words.pop()
+            while words and words[-1].upper() in purpose_markers: words.pop()
+            while words and words[-1] in ['-', 'END']: words.pop()
                 
             rev = "1"
             if len(words) >= 2 and words[0].isdigit() and (len(words[1]) <= 3 and words[1].isalnum() and not words[1].isdigit()):
@@ -182,29 +185,21 @@ def extract_cover_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
                 
             title_parts = [ " ".join(words).strip() ]
             
-            # Quét gom các dòng kế tiếp nếu tiêu đề bị ngắt dòng trong ô bảng tính
+            # Quét gom dòng bị ngắt
             j = i + 1
-            while j < len(lines):
-                next_line = lines[j].strip()
-                # Dừng nếu gặp mục mới hoặc hết bảng
+            while j < len(all_lines_to_check):
+                next_line = all_lines_to_check[j].strip()
                 if re.search(r'(QT1-[0-9L]-[A-Za-z0-9_-]+)', next_line) or re.match(r'^\d{1,2}\s+', next_line) or "Purpose:" in next_line:
                     break
                 if next_line and not any(k in next_line for k in ["Sheet:", "Date:", "Page", "END -"]):
-                    # Lược bỏ các từ cột Purpose ở dòng tiếp theo
                     clean_next = " ".join([w for w in next_line.split() if w.upper() not in purpose_markers])
-                    if clean_next:
-                        title_parts.append(clean_next)
+                    if clean_next: title_parts.append(clean_next)
                 j += 1
                 
-            combined_title = " ".join(title_parts).strip()
-            combined_title = clean_document_title(combined_title)
+            combined_title = clean_document_title(" ".join(title_parts))
             
-            if norm_code and combined_title:
-                docs[norm_code] = {
-                    'doc_no': norm_code,
-                    'rev': rev,
-                    'title': combined_title
-                }
+            if norm_code and combined_title and combined_title.lower() != subject.lower():
+                docs[norm_code] = {'doc_no': norm_code, 'rev': rev, 'title': combined_title}
         i += 1
 
     return {
@@ -214,6 +209,10 @@ def extract_cover_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
         'docs': docs
     }
 
+# =========================================================================
+# MODULE 2: HÀM TIỆN ÍCH WORD/EXCEL
+# =========================================================================
+
 def find_template(prefix):
     search_dirs = [BASE_DIR, os.getcwd(), r"G:\Shared drives\Test auto"]
     for d in search_dirs:
@@ -222,8 +221,7 @@ def find_template(prefix):
             if f.lower().endswith(".docx"):
                 clean_f = f.lower().replace("đ", "d").replace("ð", "d")
                 clean_p = prefix.lower().replace("đ", "d").replace("ð", "d")
-                if clean_p in clean_f and not f.startswith("~$"):
-                    return os.path.join(d, f)
+                if clean_p in clean_f and not f.startswith("~$"): return os.path.join(d, f)
     return None
 
 def find_car_template():
@@ -232,8 +230,7 @@ def find_car_template():
         if not os.path.exists(d): continue
         for f in os.listdir(d):
             if f.lower().endswith(".xlsx") and not f.startswith("~$"):
-                f_low = f.lower()
-                if any(k in f_low for k in ["template", "car", "00xx", "xxxx"]):
+                if any(k in f.lower() for k in ["template", "car", "00xx", "xxxx"]):
                     return os.path.join(d, f)
     return None
 
@@ -242,52 +239,26 @@ def create_fresh_car_wb():
     ws = wb.active
     ws.title = "ROUND 1 CaRs"
     ws.views.sheetView[0].showGridLines = True
-    
-    col_widths = {
-        'A': 4.5, 'B': 1.5, 'C': 16.0, 'D': 1.5, 'E': 20.0,
-        'F': 1.5, 'G': 48.0, 'H': 1.5, 'I': 58.0, 'J': 1.5, 'K': 4.5, 'L': 14.0
-    }
-    for col, width in col_widths.items():
-        ws.column_dimensions[col].width = width
-
+    col_widths = {'A': 4.5, 'B': 1.5, 'C': 16.0, 'D': 1.5, 'E': 20.0, 'F': 1.5, 'G': 48.0, 'H': 1.5, 'I': 58.0, 'J': 1.5, 'K': 4.5, 'L': 14.0}
+    for col, width in col_widths.items(): ws.column_dimensions[col].width = width
     dot = Side(border_style="dotted", color="808080")
     dotted_box = Border(top=dot, left=dot, right=dot, bottom=dot)
-
     f_title = Font(name="Times New Roman", size=16, bold=True)
     f_car_no = Font(name="Times New Roman", size=16, bold=True, color="FFFF0000")
-    f_label = Font(name="Arial", size=10, bold=False)
-    f_header = Font(name="Arial", size=10, bold=True)
-    f_status_label = Font(name="Arial", size=10, bold=True, color="FFFF0000")
-    f_status_val = Font(name="Arial", size=10, bold=True, color="FFFF0000")
-    
-    al_center = Alignment(horizontal="center", vertical="center")
-    al_left = Alignment(horizontal="left", vertical="center")
+    f_label, f_header = Font(name="Arial", size=10, bold=False), Font(name="Arial", size=10, bold=True)
+    f_status = Font(name="Arial", size=10, bold=True, color="FFFF0000")
+    al_center, al_left = Alignment(horizontal="center", vertical="center"), Alignment(horizontal="left", vertical="center")
     
     ws.merge_cells("A1:D1")
-    ws['A1'] = "CaR Nr."
-    ws['A1'].font = f_title
-    ws['A1'].alignment = al_left
-    ws['E1'].font = f_car_no
-    ws['E1'].alignment = al_left
+    ws['A1'], ws['A1'].font, ws['A1'].alignment = "CaR Nr.", f_title, al_left
+    ws['E1'].font, ws['E1'].alignment = f_car_no, al_left
 
-    labels = [
-        (2, "i", "Sender of Document"),
-        (3, "ii", "Covering Letter No & Date"),
-        (4, "iii", "Doc Ident No & Rev"),
-        (5, "iv", "Title of Document"),
-        (6, "v", "Date Doc Rec'd by EVN/Consultant"),
-        (7, "vi", "Reviewed by & date completed"),
-        (8, "vii", "Date & No CaRs is issued to PMB2"),
-        (9, "viii", "Date & No CaRs is issued to Contractor")
-    ]
+    labels = [(2, "i", "Sender of Document"), (3, "ii", "Covering Letter No & Date"), (4, "iii", "Doc Ident No & Rev"), (5, "iv", "Title of Document"), (6, "v", "Date Doc Rec'd by EVN/Consultant"), (7, "vi", "Reviewed by & date completed"), (8, "vii", "Date & No CaRs is issued to PMB2"), (9, "viii", "Date & No CaRs is issued to Contractor")]
     for r, num_rom, text in labels:
-        ws.cell(row=r, column=1, value=num_rom).font = f_label
-        ws.cell(row=r, column=1).alignment = al_center
+        ws.cell(row=r, column=1, value=num_rom).font, ws.cell(row=r, column=1).alignment = f_label, al_center
         ws.merge_cells(f"C{r}:E{r}")
-        ws.cell(row=r, column=3, value=text).font = f_label
-        ws.cell(row=r, column=3).alignment = al_left
-        ws.cell(row=r, column=7).font = f_header
-        ws.cell(row=r, column=7).alignment = al_left
+        ws.cell(row=r, column=3, value=text).font, ws.cell(row=r, column=3).alignment = f_label, al_left
+        ws.cell(row=r, column=7).font, ws.cell(row=r, column=7).alignment = f_header, al_left
 
     ws.cell(row=10, column=3, value="Contract /").font = f_header
     ws.cell(row=10, column=5, value="Doc Cls/Page").font = f_header
@@ -296,32 +267,23 @@ def create_fresh_car_wb():
 
     headers = [(1, "No"), (3, "Spec Ref"), (5, "Drg Ref etc"), (7, "ROUND 1 COMMENTS"), (9, "ROUND 1 REPLIES")]
     for c, h_text in headers:
-        cell = ws.cell(row=11, column=c, value=h_text)
-        cell.font = f_header
-        cell.alignment = al_center if c == 1 else al_left
+        ws.cell(row=11, column=c, value=h_text).font = f_header
+        ws.cell(row=11, column=c).alignment = al_center if c == 1 else al_left
 
-    ws.cell(row=13, column=7, value="STATUS AFTER ROUND 1 COMMENTS:").font = f_status_label
-    ws.cell(row=14, column=7, value="APPROVED (APP)").font = f_status_val
+    ws.cell(row=13, column=7, value="STATUS AFTER ROUND 1 COMMENTS:").font = f_status
+    ws.cell(row=14, column=7, value="APPROVED (APP)").font = f_status
     ws.cell(row=15, column=7, value="General Comments").font = f_header
-    ws.cell(row=16, column=1, value=1).font = f_label
-    ws.cell(row=16, column=1).alignment = al_center
+    ws.cell(row=16, column=1, value=1).font, ws.cell(row=16, column=1).alignment = f_label, al_center
     ws.cell(row=16, column=7, value="No comment.").font = f_label
     
     for r in range(17, 27):
-        ws.cell(row=r, column=1, value=r - 15).font = f_label
-        ws.cell(row=r, column=1).alignment = al_center
-        
+        ws.cell(row=r, column=1, value=r - 15).font, ws.cell(row=r, column=1).alignment = f_label, al_center
     ws.cell(row=27, column=7, value="Detailed Comments").font = f_header
     for r in range(28, 36):
-        ws.cell(row=r, column=1, value=r - 27).font = f_label
-        ws.cell(row=r, column=1).alignment = al_center
-
+        ws.cell(row=r, column=1, value=r - 27).font, ws.cell(row=r, column=1).alignment = f_label, al_center
     for r in range(1, 36):
         for c in range(1, 13):
-            cell = ws.cell(row=r, column=c)
-            if r >= 11:
-                cell.border = dotted_box
-                
+            if r >= 11: ws.cell(row=r, column=c).border = dotted_box
     return wb
 
 def replace_value_after_keyword(paragraph, keyword, new_text):
@@ -330,78 +292,56 @@ def replace_value_after_keyword(paragraph, keyword, new_text):
             paragraph.text = f"{keyword} {new_text}"
             return True
         kw_font = paragraph.runs[0].font
-        kw_name = kw_font.name
-        kw_size = kw_font.size
-        kw_bold = kw_font.bold
-        kw_italic = kw_font.italic
-        
+        kw_name, kw_size, kw_bold, kw_italic = kw_font.name, kw_font.size, kw_font.bold, kw_font.italic
         val_font = paragraph.runs[-1].font
-        val_name = val_font.name
-        val_size = val_font.size
-        val_bold = val_font.bold
-        val_italic = val_font.italic
+        val_name, val_size, val_bold, val_italic = val_font.name, val_font.size, val_font.bold, val_font.italic
         
         paragraph.clear()
         r1 = paragraph.add_run(keyword)
-        r1.font.name = kw_name
-        r1.font.size = kw_size
-        r1.font.bold = kw_bold
-        r1.font.italic = kw_italic
-
+        r1.font.name, r1.font.size, r1.font.bold, r1.font.italic = kw_name, kw_size, kw_bold, kw_italic
         r2 = paragraph.add_run(" " + new_text)
-        r2.font.name = val_name
-        r2.font.size = val_size
-        r2.font.bold = val_bold
-        r2.font.italic = val_italic
+        r2.font.name, r2.font.size, r2.font.bold, r2.font.italic = val_name, val_size, val_bold, val_italic
         return True
     return False
 
 def update_date_paragraph(paragraph, new_date_str):
-    spaces = "                                "
     val_font = paragraph.runs[-1].font
-    val_name = val_font.name
-    val_size = val_font.size
-    val_bold = val_font.bold
-    val_italic = val_font.italic
-    
+    val_name, val_size, val_bold, val_italic = val_font.name, val_font.size, val_font.bold, val_font.italic
     paragraph.clear()
-    r1 = paragraph.add_run(spaces)
+    paragraph.add_run("                                ")
     r2 = paragraph.add_run(new_date_str)
-    r2.font.name = val_name
-    r2.font.size = val_size
-    r2.font.bold = val_bold
-    r2.font.italic = val_italic
+    r2.font.name, r2.font.size, r2.font.bold, r2.font.italic = val_name, val_size, val_bold, val_italic
 
 def sync_footer_content(doc, qti_no, subject):
     new_text = f"{qti_no} {subject}"
     for section in doc.sections:
-        footer = section.footer
-        if footer:
-            for p in footer.paragraphs:
+        if section.footer:
+            for p in section.footer.paragraphs:
                 if p.text.strip():
                     if len(p.runs) > 0:
-                        first_font = p.runs[0].font
+                        f_font = p.runs[0].font
                         p.clear()
                         r = p.add_run(new_text)
-                        r.font.name = first_font.name
-                        r.font.size = first_font.size
-                        r.font.color.rgb = first_font.color.rgb if first_font.color else RGBColor(128, 128, 128)
+                        r.font.name, r.font.size = f_font.name, f_font.size
+                        r.font.color.rgb = f_font.color.rgb if f_font.color else RGBColor(128, 128, 128)
                     else:
                         p.text = new_text
 
 def remove_temp_file(path: str):
     try:
-        if os.path.exists(path):
-            os.remove(path)
-    except Exception as e:
-        print(f"Cleanup error {path}: {e}")
+        if os.path.exists(path): os.remove(path)
+    except: pass
+
+# =========================================================================
+# MODULE 3: ĐỘNG CƠ XỬ LÝ CHÍNH
+# =========================================================================
 
 @app.post("/api/export-zip-full")
 async def export_zip_full(
     files: list[UploadFile] = File(default=[]),
     cover_file: UploadFile = File(None),
     metadata: str = Form("{}"),
-    mode: str = Form("auto_bump"),
+    mode: str = Form("auto_generate_cars"),
     qti_no: str = Form("QTI-PECC1-PMB2-26-10-155"),
     start_car_no: str = Form("9905"),
     custom_date: str = Form(""),
@@ -428,54 +368,27 @@ async def export_zip_full(
             cover_bytes = await cover_file.read()
             if cover_file.filename.lower().endswith('.pdf'):
                 cover_data = extract_cover_metadata(cover_bytes, cover_file.filename)
-            elif cover_file.filename.lower().endswith(('.xlsx', '.xls')):
-                wb_temp = openpyxl.load_workbook(io.BytesIO(cover_bytes), data_only=True)
-                ws_t = wb_temp.active
-                for r in range(1, ws_t.max_row + 1):
-                    for c in range(1, ws_t.max_column + 1):
-                        val = str(ws_t.cell(row=r, column=c).value or "").strip()
-                        m = re.match(r'^(QT1-[0-9L]-[A-Z0-9_-]+)$', val)
-                        if m and 'QT1-HDH' not in val:
-                            doc_no = normalize_doc_code(m.group(1))
-                            rev_val = str(ws_t.cell(row=r, column=c+1).value or "1").strip()
-                            title_val = clean_document_title(str(ws_t.cell(row=r, column=c+2).value or "").strip())
-                            cover_data['docs'][doc_no] = {'doc_no': doc_no, 'rev': rev_val, 'title': title_val}
             del cover_bytes
 
         if custom_date and custom_date.strip():
             cover_data['date_str'] = custom_date.strip()
 
         vi_template_path = find_template("TV")
-        if not vi_template_path: raise FileNotFoundError(f"Thiếu file mẫu TVÐ1-NÐNLM.docx trong thư mục {BASE_DIR}")
         en_template_path = find_template("QTI-PECC1")
-        if not en_template_path: raise FileNotFoundError(f"Thiếu file mẫu QTI-PECC1.docx trong thư mục {BASE_DIR}")
+        if not vi_template_path or not en_template_path: 
+            raise FileNotFoundError("Thiếu file Word mẫu (TVÐ1-NÐNLM.docx / QTI-PECC1.docx) trong server.")
 
         processed_car_list = []
-
-        try:
-            start_num = int(re.sub(r'\D', '', str(start_car_no)) or "9905")
-        except Exception:
-            start_num = 9905
+        start_num = int(re.sub(r'\D', '', str(start_car_no)) or "9905")
 
         with zipfile.ZipFile(temp_zip_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
             
-            # =========================================================================
-            # LỰA CHỌN 1: TỰ ĐỘNG TẠO CAR TỪ THƯ COVER
-            # =========================================================================
+            # --- LUỒNG 1: TỰ ĐỘNG TẠO CAR MỚI ---
             if mode == "auto_generate_cars":
-                docs_to_generate = []
-                if cover_data['docs']:
-                    docs_to_generate = list(cover_data['docs'].values())
-                else:
-                    docs_to_generate = [{
-                        'doc_no': cover_data['tr_no'],
-                        'rev': 'A',
-                        'title': cover_data['subject']
-                    }]
-
-                status_full_text = "APPROVED (APP)" if default_status == "APP" else "RETURN FOR CORRECTIONS (RFC)"
-                if default_status == "AWC": status_full_text = "APPROVED WITH COMMENTS (AWC)"
-                elif default_status == "RJ": status_full_text = "REJECTED (RJ)"
+                docs_to_generate = list(cover_data['docs'].values()) if cover_data['docs'] else [{'doc_no': cover_data['tr_no'], 'rev': 'A', 'title': cover_data['subject']}]
+                status_full = "APPROVED (APP)" if default_status == "APP" else "RETURN FOR CORRECTIONS (RFC)"
+                if default_status == "AWC": status_full = "APPROVED WITH COMMENTS (AWC)"
+                elif default_status == "RJ": status_full = "REJECTED (RJ)"
 
                 car_template_path = find_car_template()
 
@@ -483,25 +396,16 @@ async def export_zip_full(
                     cur_num = start_num + doc_idx
                     car_num_str = f"{cur_num:04d}" if cur_num < 10000 else f"{cur_num}"
                     car_base = f"{car_num_str} CaRs"
-                    car_label = f"{car_base} R1"
 
-                    if car_template_path:
-                        wb = openpyxl.load_workbook(car_template_path)
-                    else:
-                        wb = create_fresh_car_wb()
-
+                    wb = openpyxl.load_workbook(car_template_path) if car_template_path else create_fresh_car_wb()
                     for ws_item in wb.worksheets:
-                        if hasattr(ws_item, 'sheet_properties') and ws_item.sheet_properties:
-                            if hasattr(ws_item.sheet_properties, 'pageSetUpPr') and ws_item.sheet_properties.pageSetUpPr:
-                                ws_item.sheet_properties.pageSetUpPr.fitToPage = None
+                        if hasattr(ws_item, 'sheet_properties') and ws_item.sheet_properties and hasattr(ws_item.sheet_properties, 'pageSetUpPr'):
+                            ws_item.sheet_properties.pageSetUpPr.fitToPage = None
 
                     ws = wb['ROUND 1 CaRs'] if 'ROUND 1 CaRs' in wb.sheetnames else wb.active
-
-                    no_fill = PatternFill(fill_type=None)
-                    red_title_font = Font(name="Times New Roman", size=16, bold=True, color="FFFF0000")
                     ws['E1'].value = f"{car_num_str}-R1"
-                    ws['E1'].font = red_title_font
-                    ws['E1'].fill = no_fill
+                    ws['E1'].font = Font(name="Times New Roman", size=16, bold=True, color="FFFF0000")
+                    ws['E1'].fill = PatternFill(fill_type=None)
 
                     ws['G2'].value = "HYUNDAI - MITSUBISHI - CC1"
                     ws['G3'].value = cover_data['tr_no']
@@ -510,186 +414,121 @@ async def export_zip_full(
                     ws['G6'].value = cover_data['date_str']
 
                     ws['G13'].value = "STATUS AFTER ROUND 1 COMMENTS:"
-                    ws['G14'].value = status_full_text
-                    if default_status == "APP":
-                        ws['G16'].value = "No comment."
+                    ws['G14'].value = status_full
+                    if default_status == "APP": ws['G16'].value = "No comment."
 
-                    safe_title_for_name = clean_safe_filename(doc_item['title'])
-                    new_excel_name = f"{car_base} R1 {current_date_str} {doc_item['doc_no']} {safe_title_for_name} rev.{doc_item['rev']}.xlsx"
-
+                    new_excel_name = f"{car_base} R1 {current_date_str} {doc_item['doc_no']} {clean_safe_filename(doc_item['title'])} rev.{doc_item['rev']}.xlsx"
                     excel_out = io.BytesIO()
                     wb.save(excel_out)
                     zip_file.writestr(new_excel_name, excel_out.getvalue())
                     del wb, excel_out
 
                     processed_car_list.append({
-                        'doc_no': doc_item['doc_no'],
-                        'rev': doc_item['rev'],
-                        'title': doc_item['title'],
-                        'status': status_full_text,
-                        'car_label': car_label,
-                        'assigned_car_name': new_excel_name
+                        'doc_no': doc_item['doc_no'], 'rev': doc_item['rev'], 'title': doc_item['title'],
+                        'status': status_full, 'car_label': f"{car_base} R1", 'assigned_car_name': new_excel_name
                     })
 
-            # =========================================================================
-            # CÁC LỰA CHỌN CÓ NẠP FILE CAR (2, 3, 4)
-            # =========================================================================
+            # --- LUỒNG 2: XỬ LÝ CÁC FILE CAR ĐÃ TẢI LÊN ---
             elif mode != "no_car_letter" and files:
                 for file_idx, file in enumerate(files):
                     try:
                         content = await file.read()
+                        wb = openpyxl.load_workbook(io.BytesIO(content))
+                        for ws_item in wb.worksheets:
+                            if hasattr(ws_item, 'sheet_properties') and ws_item.sheet_properties and hasattr(ws_item.sheet_properties, 'pageSetUpPr'):
+                                ws_item.sheet_properties.pageSetUpPr.fitToPage = None
 
-                        # -------------------------------------------------------------
-                        # LỰA CHỌN 2: CẤP SỐ CHO CAR KỸ SƯ ĐÃ NHẬN XÉT
-                        # -------------------------------------------------------------
+                        max_r = 1
+                        target_idx = 0
+                        for idx, s_name in enumerate(wb.sheetnames):
+                            m = re.search(r'round\s*(\d+)', s_name, re.IGNORECASE)
+                            if m and int(m.group(1)) >= max_r:
+                                max_r = int(m.group(1))
+                                target_idx = idx
+
+                        source_ws = wb.worksheets[target_idx]
+                        
+                        # Identify columns
+                        prev_com_col, prev_rep_col = None, None
+                        for c in range(1, source_ws.max_column + 1):
+                            val_h = str(source_ws.cell(row=11, column=c).value or "").upper()
+                            if f"ROUND {max_r} COMMENTS" in val_h: prev_com_col = c
+                            elif f"ROUND {max_r} REPLIES" in val_h: prev_rep_col = c
+                        if not prev_com_col: prev_com_col = 7
+
+                        # XÁC ĐỊNH MÃ DOC NO VÀ TITLE (3-TIER HIERARCHY LÀM SẠCH)
+                        detected_doc_code = ""
+                        for c in range(3, source_ws.max_column + 1):
+                            v_c = str(source_ws.cell(row=4, column=c).value or "")
+                            if "QT1-" in v_c:
+                                detected_doc_code = normalize_doc_code(v_c)
+                                break
+                        if not detected_doc_code: detected_doc_code = normalize_doc_code(file.filename)
+
+                        cover_info = cover_data['docs'].get(detected_doc_code, {})
+                        final_doc_no = cover_info.get('doc_no', detected_doc_code if detected_doc_code else "QT1-Document")
+                        final_rev = cover_info.get('rev', '1')
+
+                        # Ưu tiên 1: Lấy từ Cover nếu có (Và không bị lấy nhầm Subject)
+                        if cover_info.get('title') and cover_info['title'].lower() != cover_data['subject'].lower():
+                            final_title = cover_info['title']
+                        else:
+                            # Ưu tiên 2: Tên file
+                            title_from_fn = extract_title_from_filename(file.filename)
+                            if title_from_fn:
+                                final_title = title_from_fn
+                            else:
+                                # Ưu tiên 3: Tên ở ô G5 của Round cũ
+                                r5_val = clean_document_title(str(source_ws.cell(row=5, column=prev_com_col).value or ""))
+                                final_title = r5_val if r5_val else cover_data['subject']
+
+                        cur_num = start_num + file_idx
+                        car_num_str = f"{cur_num:04d}" if cur_num < 10000 else f"{cur_num}"
+                        car_base = f"{car_num_str} CaRs"
+
+                        # =======================================================
                         if mode == "number_filled_cars":
-                            cur_num = start_num + file_idx
-                            car_num_str = f"{cur_num:04d}" if cur_num < 10000 else f"{cur_num}"
-                            car_base = f"{car_num_str} CaRs"
-
-                            wb = openpyxl.load_workbook(io.BytesIO(content))
-                            for ws_item in wb.worksheets:
-                                if hasattr(ws_item, 'sheet_properties') and ws_item.sheet_properties:
-                                    if hasattr(ws_item.sheet_properties, 'pageSetUpPr') and ws_item.sheet_properties.pageSetUpPr:
-                                        ws_item.sheet_properties.pageSetUpPr.fitToPage = None
-
-                            max_r = 1
-                            target_ws = wb.active
-                            for s_name in wb.sheetnames:
-                                m = re.search(r'round\s*(\d+)', s_name, re.IGNORECASE)
-                                if m and int(m.group(1)) >= max_r:
-                                    max_r = int(m.group(1))
-                                    target_ws = wb[s_name]
-
-                            car_label = f"{car_base} R{max_r}"
-
-                            com_col = None
-                            for c in range(1, target_ws.max_column + 1):
-                                val_h = str(target_ws.cell(row=11, column=c).value or "").upper()
-                                if f"ROUND {max_r} COMMENTS" in val_h or f"ROUND {max_r} COMMENT" in val_h:
-                                    com_col = c
-                                    break
-                            if not com_col: com_col = 7
-
                             detected_status_raw = "APPROVED (APP)"
                             found_rfc, found_awc, found_rj = False, False, False
                             for r in range(11, 16):
-                                v_st = str(target_ws.cell(row=r, column=com_col).value or "").strip().upper()
-                                if "RETURN FOR CORRECTIONS" in v_st or "(RFC)" in v_st or v_st == "RFC":
-                                    found_rfc = True
-                                elif "APPROVED WITH COMMENTS" in v_st or "(AWC)" in v_st or v_st == "AWC":
-                                    found_awc = True
-                                elif "REJECTED" in v_st or "(RJ)" in v_st or v_st == "RJ":
-                                    found_rj = True
-
+                                v_st = str(source_ws.cell(row=r, column=prev_com_col).value or "").strip().upper()
+                                if "RETURN FOR CORRECTIONS" in v_st or "(RFC)" in v_st or v_st == "RFC": found_rfc = True
+                                elif "APPROVED WITH COMMENTS" in v_st or "(AWC)" in v_st or v_st == "AWC": found_awc = True
+                                elif "REJECTED" in v_st or "(RJ)" in v_st or v_st == "RJ": found_rj = True
                             if found_rfc: detected_status_raw = "RETURN FOR CORRECTIONS (RFC)"
                             elif found_awc: detected_status_raw = "APPROVED WITH COMMENTS (AWC)"
                             elif found_rj: detected_status_raw = "REJECTED (RJ)"
-                            else: detected_status_raw = "APPROVED (APP)"
-
-                            # Bóc tách mã bản vẽ từ hàng 4 (bỏ qua cột A, B)
-                            detected_doc_code = ""
-                            r4_val = ""
-                            for c in range(3, target_ws.max_column + 1):
-                                v_c = str(target_ws.cell(row=4, column=c).value or "")
-                                if "QT1-" in v_c:
-                                    detected_doc_code = normalize_doc_code(v_c)
-                                    r4_val = v_c
-                                    break
-                            if not detected_doc_code:
-                                detected_doc_code = normalize_doc_code(file.filename)
-
-                            cover_info = cover_data['docs'].get(detected_doc_code, {})
-                            final_doc_no = cover_info.get('doc_no', detected_doc_code if detected_doc_code else "QT1-Document")
-                            final_rev = cover_info.get('rev', '1')
-
-                            # Lấy tên tài liệu: Tuyệt đối không đọc cột A và B
-                            r5_val = ""
-                            v_com = str(target_ws.cell(row=5, column=com_col).value or "").strip()
-                            if v_com:
-                                r5_val = clean_document_title(v_com)
-                            if not r5_val:
-                                for c in range(6, target_ws.max_column + 1):
-                                    v_c5 = str(target_ws.cell(row=5, column=c).value or "").strip()
-                                    cleaned = clean_document_title(v_c5)
-                                    if cleaned:
-                                        r5_val = cleaned
-                                        break
-
-                            title_from_fn = extract_title_from_filename(file.filename)
-
-                            if cover_info.get('title') and cover_info['title'].lower() != cover_data['subject'].lower():
-                                final_title = cover_info['title']
-                            elif title_from_fn:
-                                final_title = title_from_fn
-                            elif r5_val:
-                                final_title = r5_val
-                            else:
-                                final_title = cover_data['subject']
-
-                            # Cấp số CaR vào ô E1 (Xóa bỏ hoàn toàn màu nền bôi vàng)
-                            red_title_font = Font(name="Times New Roman", size=16, bold=True, color="FFFF0000")
-                            no_fill = PatternFill(fill_type=None)
-                            e1_text = f"{car_num_str}-R{max_r}"
-
+                            
                             found_cell_r1 = False
                             for c in range(2, 10):
-                                val_r1 = str(target_ws.cell(row=1, column=c).value or "").strip()
+                                val_r1 = str(source_ws.cell(row=1, column=c).value or "").strip()
                                 if re.search(r'(00xx|xxxx|Xxxx)', val_r1, re.IGNORECASE):
-                                    target_ws.cell(row=1, column=c).value = e1_text
-                                    target_ws.cell(row=1, column=c).font = red_title_font
-                                    target_ws.cell(row=1, column=c).fill = no_fill
+                                    source_ws.cell(row=1, column=c).value = f"{car_base} - R{max_r}"
+                                    source_ws.cell(row=1, column=c).font = Font(name="Times New Roman", size=16, bold=True, color="FFFF0000")
+                                    source_ws.cell(row=1, column=c).fill = PatternFill(fill_type=None)
                                     found_cell_r1 = True
                                     break
                             if not found_cell_r1:
-                                target_ws.cell(row=1, column=5).value = e1_text
-                                target_ws.cell(row=1, column=5).font = red_title_font
-                                target_ws.cell(row=1, column=5).fill = no_fill
+                                source_ws.cell(row=1, column=5).value = f"{car_base} - R{max_r}"
+                                source_ws.cell(row=1, column=5).font = Font(name="Times New Roman", size=16, bold=True, color="FFFF0000")
+                                source_ws.cell(row=1, column=5).fill = PatternFill(fill_type=None)
 
-                            target_ws.cell(row=4, column=com_col).value = f"{final_doc_no} rev.{final_rev}"
-                            target_ws.cell(row=5, column=com_col).value = final_title
+                            source_ws.cell(row=4, column=prev_com_col).value = f"{final_doc_no} rev.{final_rev}"
+                            source_ws.cell(row=5, column=prev_com_col).value = final_title
 
-                            safe_title_for_name = clean_safe_filename(final_title)
-                            new_excel_name = f"{car_base} R{max_r} {current_date_str} {final_doc_no} {safe_title_for_name} rev.{final_rev}.xlsx"
-
+                            new_excel_name = f"{car_base} R{max_r} {current_date_str} {final_doc_no} {clean_safe_filename(final_title)} rev.{final_rev}.xlsx"
                             excel_out = io.BytesIO()
                             wb.save(excel_out)
                             zip_file.writestr(new_excel_name, excel_out.getvalue())
                             del wb, excel_out
 
                             processed_car_list.append({
-                                'doc_no': final_doc_no,
-                                'rev': final_rev,
-                                'title': final_title,
-                                'status': detected_status_raw,
-                                'car_label': car_label,
-                                'assigned_car_name': new_excel_name
+                                'doc_no': final_doc_no, 'rev': final_rev, 'title': final_title,
+                                'status': detected_status_raw, 'car_label': f"{car_base} R{max_r}", 'assigned_car_name': new_excel_name
                             })
 
-                        # -------------------------------------------------------------
-                        # LỰA CHỌN 3: TỰ ĐỘNG TẠO ROUND TIẾP THEO (R+1)
-                        # -------------------------------------------------------------
+                        # =======================================================
                         elif mode == "auto_bump":
-                            wb = openpyxl.load_workbook(io.BytesIO(content))
-                            for ws_item in wb.worksheets:
-                                if hasattr(ws_item, 'sheet_properties') and ws_item.sheet_properties:
-                                    if hasattr(ws_item.sheet_properties, 'pageSetUpPr') and ws_item.sheet_properties.pageSetUpPr:
-                                        ws_item.sheet_properties.pageSetUpPr.fitToPage = None
-
-                            max_r = 1
-                            target_sheet_name = wb.sheetnames[0]
-                            target_idx = 0
-                            for idx, s_name in enumerate(wb.sheetnames):
-                                m = re.search(r'round\s*(\d+)', s_name, re.IGNORECASE)
-                                if m and int(m.group(1)) >= max_r:
-                                    max_r = int(m.group(1))
-                                    target_sheet_name = s_name
-                                    target_idx = idx
-
-                            source_ws = wb[target_sheet_name]
-                            car_p = re.search(r'(\d{4,}\s*CaRs)', file.filename, re.IGNORECASE)
-                            car_base = car_p.group(1) if car_p else "CaRs"
-
                             selected_status = car_metadata.get(file.filename, "APP")
                             new_r_num = max_r + 1
                             new_ws = wb.copy_worksheet(source_ws)
@@ -697,73 +536,15 @@ async def export_zip_full(
                             wb._sheets.remove(new_ws)
                             wb._sheets.insert(target_idx + 1, new_ws)
 
-                            prev_com_col, prev_rep_col = None, None
-                            for c in range(1, new_ws.max_column + 1):
-                                val_h = str(new_ws.cell(row=11, column=c).value or "").upper()
-                                if f"ROUND {max_r} COMMENTS" in val_h: prev_com_col = c
-                                elif f"ROUND {max_r} REPLIES" in val_h: prev_rep_col = c
-
-                            if not prev_com_col: prev_com_col = 7
                             new_com_col = (prev_rep_col + 1) if prev_rep_col else (new_ws.max_column + 1)
                             new_rep_col = new_com_col + 2
 
-                            # Lấy mã Doc No từ ô hàng 4 của cột nhận xét trước đó
-                            detected_doc_code = ""
-                            r4_val = str(source_ws.cell(row=4, column=prev_com_col).value or "")
-                            if r4_val:
-                                detected_doc_code = normalize_doc_code(r4_val)
-                            if not detected_doc_code:
-                                for c in range(3, source_ws.max_column + 1):
-                                    v_c = str(source_ws.cell(row=4, column=c).value or "")
-                                    if "QT1-" in v_c:
-                                        detected_doc_code = normalize_doc_code(v_c)
-                                        r4_val = v_c
-                                        break
-                            if not detected_doc_code:
-                                detected_doc_code = normalize_doc_code(file.filename)
-
-                            cover_info = cover_data['docs'].get(detected_doc_code, {})
-                            final_doc_no = cover_info.get('doc_no', detected_doc_code if detected_doc_code else "QT1-Document")
-                            
-                            if cover_info.get('rev'):
-                                final_rev = cover_info['rev']
-                            else:
-                                m_rev = re.search(r'rev\.?\s*([A-Za-z0-9]+)', r4_val, re.IGNORECASE)
-                                final_rev = m_rev.group(1) if m_rev else "1"
-
-                            # Lấy tiêu đề: Bỏ qua hoàn toàn cột A, B. Đọc trực tiếp từ cột prev_com_col
-                            r5_val = ""
-                            v_prev5 = str(source_ws.cell(row=5, column=prev_com_col).value or "").strip()
-                            if v_prev5:
-                                r5_val = clean_document_title(v_prev5)
-                            if not r5_val:
-                                for c in range(6, source_ws.max_column + 1):
-                                    v_c5 = str(source_ws.cell(row=5, column=c).value or "").strip()
-                                    cleaned = clean_document_title(v_c5)
-                                    if cleaned:
-                                        r5_val = cleaned
-                                        break
-
-                            title_from_fn = extract_title_from_filename(file.filename)
-
-                            # Phân cấp lấy tiêu đề chuẩn xác
-                            if cover_info.get('title') and cover_info['title'].lower() != cover_data['subject'].lower():
-                                final_title = cover_info['title']
-                            elif title_from_fn:
-                                final_title = title_from_fn
-                            elif r5_val:
-                                final_title = r5_val
-                            else:
-                                final_title = cover_data['subject']
-
-                            # Cập nhật số CaR tại ô E1
                             for c in range(2, 10):
                                 v = str(new_ws.cell(row=1, column=c).value or "")
                                 if re.search(r'-\s*R\d+', v, re.IGNORECASE) or (c == 5 and v):
                                     new_ws.cell(row=1, column=c).value = re.sub(r'R\d+', f'R{new_r_num}', v, flags=re.IGNORECASE)
                                     break
 
-                            # Cập nhật thông tin Header mới
                             new_ws.cell(row=2, column=new_com_col).value = "EVNPMB2"
                             new_ws.cell(row=3, column=new_com_col).value = cover_data['tr_no']
                             new_ws.cell(row=4, column=new_com_col).value = f"{final_doc_no} rev.{final_rev}"
@@ -772,134 +553,77 @@ async def export_zip_full(
                             new_ws.cell(row=11, column=new_com_col).value = f"ROUND {new_r_num} COMMENTS"
                             new_ws.cell(row=11, column=new_rep_col).value = f"ROUND {new_r_num} REPLIES"
 
-                            status_full_text = "APPROVED (APP)" if selected_status == "APP" else "RETURN FOR CORRECTIONS (RFC)"
-                            if selected_status == "AWC": status_full_text = "APPROVED WITH COMMENTS (AWC)"
-                            elif selected_status == "RJ": status_full_text = "REJECTED (RJ)"
+                            status_full = "APPROVED (APP)" if selected_status == "APP" else "RETURN FOR CORRECTIONS (RFC)"
+                            if selected_status == "AWC": status_full = "APPROVED WITH COMMENTS (AWC)"
+                            elif selected_status == "RJ": status_full = "REJECTED (RJ)"
 
                             new_ws.cell(row=12, column=new_com_col).value = f"STATUS AFTER ROUND {new_r_num} COMMENTS:"
-                            new_ws.cell(row=13, column=new_com_col).value = status_full_text
-
+                            new_ws.cell(row=13, column=new_com_col).value = status_full
                             red_bold = Font(name="Arial", size=10, bold=True, color="FFFF0000")
-                            new_ws.cell(row=12, column=new_com_col).font = red_bold
-                            new_ws.cell(row=13, column=new_com_col).font = red_bold
-
+                            new_ws.cell(row=12, column=new_com_col).font, new_ws.cell(row=13, column=new_com_col).font = red_bold, red_bold
                             new_ws.column_dimensions[openpyxl.utils.get_column_letter(new_com_col)].width = 38
                             new_ws.column_dimensions[openpyxl.utils.get_column_letter(new_rep_col)].width = 38
 
                             limit_row = min(new_ws.max_row, 100)
                             for r in range(14, limit_row + 1):
                                 v_prev_c = str(new_ws.cell(row=r, column=prev_com_col).value or "").strip()
-                                if v_prev_c:
-                                    is_group = "general comment" in v_prev_c.lower() or "detailed comment" in v_prev_c.lower()
-                                    if not is_group and selected_status == "APP":
-                                        new_ws.cell(row=r, column=new_com_col).value = "Noted."
+                                if v_prev_c and not ("general comment" in v_prev_c.lower() or "detailed comment" in v_prev_c.lower()):
+                                    if selected_status == "APP": new_ws.cell(row=r, column=new_com_col).value = "Noted."
 
-                            safe_title_for_name = clean_safe_filename(final_title)
-                            new_excel_name = f"{car_base} R{new_r_num} {current_date_str} {final_doc_no} {safe_title_for_name} rev.{final_rev}.xlsx"
-
+                            new_excel_name = f"{car_base} R{new_r_num} {current_date_str} {final_doc_no} {clean_safe_filename(final_title)} rev.{final_rev}.xlsx"
                             excel_out = io.BytesIO()
                             wb.save(excel_out)
                             zip_file.writestr(new_excel_name, excel_out.getvalue())
                             del wb, excel_out
 
                             processed_car_list.append({
-                                'doc_no': final_doc_no,
-                                'rev': final_rev,
-                                'title': final_title,
-                                'status': status_full_text,
-                                'car_label': f"{car_base} R{new_r_num}",
-                                'assigned_car_name': new_excel_name
+                                'doc_no': final_doc_no, 'rev': final_rev, 'title': final_title,
+                                'status': status_full, 'car_label': f"{car_base} R{new_r_num}", 'assigned_car_name': new_excel_name
                             })
 
-                        # -------------------------------------------------------------
-                        # LỰA CHỌN 4: TRÍCH XUẤT THƯ TỪ BỘ CAR HOÀN THIỆN
-                        # -------------------------------------------------------------
-                        else:
-                            wb_ro = openpyxl.load_workbook(io.BytesIO(content), read_only=True)
-                            max_r = 1
-                            target_sheet_name = wb_ro.sheetnames[0]
-                            for s_name in wb_ro.sheetnames:
-                                m = re.search(r'round\s*(\d+)', s_name, re.IGNORECASE)
-                                if m and int(m.group(1)) >= max_r:
-                                    max_r = int(m.group(1))
-                                    target_sheet_name = s_name
+                        # =======================================================
+                        elif mode == "pre_prepared":
+                            status_full = "APPROVED (APP)"
+                            for r in [13, 14, 12]:
+                                st_val = str(source_ws.cell(row=r, column=prev_com_col).value or "").upper()
+                                if "RFC" in st_val: status_full = "RETURN FOR CORRECTIONS (RFC)"
+                                elif "AWC" in st_val: status_full = "APPROVED WITH COMMENTS (AWC)"
+                                elif "RJ" in st_val: status_full = "REJECTED (RJ)"
 
-                            source_ws = wb_ro[target_sheet_name]
-                            car_p = re.search(r'(\d{4,}\s*CaRs)', file.filename, re.IGNORECASE)
-                            car_base = car_p.group(1) if car_p else "CaRs"
-
-                            detected_doc_code = normalize_doc_code(file.filename)
-                            title_from_fn = extract_title_from_filename(file.filename)
-
-                            cover_info = cover_data['docs'].get(detected_doc_code, {})
-                            final_doc_no = cover_info.get('doc_no', detected_doc_code if detected_doc_code else "QT1-Document")
-                            final_rev = cover_info.get('rev', '1')
-
-                            if cover_info.get('title') and cover_info['title'].lower() != cover_data['subject'].lower():
-                                final_title = cover_info['title']
-                            elif title_from_fn:
-                                final_title = title_from_fn
-                            else:
-                                final_title = cover_data['subject']
+                            car_base = re.search(r'(\d{4,}\s*CaRs?)', file.filename, re.IGNORECASE)
+                            car_lbl = car_base.group(1) if car_base else "CaRs"
                             
-                            status_full_text = "APPROVED (APP)"
-                            for c in range(1, source_ws.max_column + 1):
-                                val = str(source_ws.cell(row=11, column=c).value or "").upper()
-                                if f"ROUND {max_r} COMMENTS" in val:
-                                    st_val = str(source_ws.cell(row=13, column=c).value or "").upper()
-                                    if "RFC" in st_val: status_full_text = "RETURN FOR CORRECTIONS (RFC)"
-                                    elif "AWC" in st_val: status_full_text = "APPROVED WITH COMMENTS (AWC)"
-                                    elif "RJ" in st_val: status_full_text = "REJECTED (RJ)"
-                                    break
-
-                            del wb_ro
                             zip_file.writestr(clean_safe_filename(file.filename), content)
-                            
                             processed_car_list.append({
-                                'doc_no': final_doc_no,
-                                'rev': final_rev,
-                                'title': final_title,
-                                'status': status_full_text,
-                                'car_label': f"{car_base} R{max_r}",
-                                'assigned_car_name': file.filename
+                                'doc_no': final_doc_no, 'rev': final_rev, 'title': final_title,
+                                'status': status_full, 'car_label': f"{car_lbl} R{max_r}", 'assigned_car_name': file.filename
                             })
-
+                        
                         del content
                         gc.collect()
 
                     except Exception as fe:
-                        print(f"Lỗi xử lý file {file.filename}: {fe}")
-                        traceback.print_exc()
+                        print(f"Lỗi tệp {file.filename}: {fe}")
 
-            # =========================================================================
-            # LỰA CHỌN 5: PHÚC ĐÁP CÔNG VĂN (KHÔNG KÈM CAR)
-            # =========================================================================
+            # --- LUỒNG 3: TRẢ LỜI CÔNG VĂN (KHÔNG KÈM CAR) ---
             elif mode == "no_car_letter":
                 if cover_data['docs']:
                     for doc_k, d_info in reversed(list(cover_data['docs'].items())):
                         processed_car_list.append({
-                            'doc_no': d_info['doc_no'],
-                            'rev': d_info['rev'],
-                            'title': d_info['title'],
-                            'status': 'REVIEWED (NO CAR)',
-                            'car_label': 'N/A',
-                            'assigned_car_name': 'N/A (Chỉ thư Cover)'
+                            'doc_no': d_info['doc_no'], 'rev': d_info['rev'], 'title': d_info['title'],
+                            'status': 'REVIEWED (NO CAR)', 'car_label': 'N/A', 'assigned_car_name': 'N/A'
                         })
                 else:
                     processed_car_list.append({
-                        'doc_no': cover_data['tr_no'],
-                        'rev': '0',
-                        'title': cover_data['subject'],
-                        'status': 'REVIEWED (NO CAR)',
-                        'car_label': 'N/A',
-                        'assigned_car_name': 'N/A (Chỉ thư Cover)'
+                        'doc_no': cover_data['tr_no'], 'rev': '0', 'title': cover_data['subject'],
+                        'status': 'REVIEWED (NO CAR)', 'car_label': 'N/A', 'assigned_car_name': 'N/A'
                     })
 
+            # =========================================================================
+            # ĐỒNG BỘ 2 THƯ WORD COVER
+            # =========================================================================
             safe_subj_name = clean_safe_filename(cover_data['subject'])
 
-            # =========================================================================
-            # XUẤT TỜ TRÌNH TIẾNG VIỆT
-            # =========================================================================
             doc_vi = Document(vi_template_path)
             for tbl in doc_vi.tables:
                 for row in tbl.rows:
@@ -908,25 +632,18 @@ async def export_zip_full(
                             if "ngày" in p.text and "tháng" in p.text:
                                 p.runs[0].text = f"Hà Nội, ngày {now.day} tháng {now.month} năm {now.year}"
                                 for r in p.runs[1:]: r.text = ""
-                            if "V/v" in p.text:
-                                replace_value_after_keyword(p, "V/v", cover_data['subject'])
+                            if "V/v" in p.text: replace_value_after_keyword(p, "V/v", cover_data['subject'])
 
             for p in doc_vi.paragraphs:
-                if "Căn cứ" in p.text or "Công ty Cổ phần" in p.text:
-                    p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+                if "Căn cứ" in p.text or "Công ty Cổ phần" in p.text: p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
                 if "Căn cứ công văn số" in p.text:
-                    target_sentence = f"{cover_data['tr_no']} ngày {cover_data['date_str']} của Nhà thầu EPC gói 15 về {cover_data['subject']}."
-                    if not replace_value_after_keyword(p, "Căn cứ công văn số", target_sentence):
-                        p.text = f"Căn cứ công văn số {target_sentence}"
+                    tgt = f"{cover_data['tr_no']} ngày {cover_data['date_str']} của Nhà thầu EPC gói 15 về {cover_data['subject']}."
+                    if not replace_value_after_keyword(p, "Căn cứ công văn số", tgt): p.text = f"Căn cứ công văn số {tgt}"
 
             vi_io = io.BytesIO()
             doc_vi.save(vi_io)
             zip_file.writestr(f"TVÐ1-NÐNLM {safe_subj_name}.docx", vi_io.getvalue())
-            del vi_io, doc_vi
 
-            # =========================================================================
-            # XUẤT THƯ TIẾNG ANH
-            # =========================================================================
             doc_en = Document(en_template_path)
             doc_type_en = "Letter" if "-L-" in cover_data['tr_no'].upper() else "Transmittal"
 
@@ -934,37 +651,29 @@ async def export_zip_full(
                 for row in tbl.rows:
                     for cell in row.cells:
                         for p in cell.paragraphs:
-                            if "Ref. No.:" in p.text:
-                                replace_value_after_keyword(p, "Ref. No.:", cover_data['tr_no'])
-                            elif "October" in p.text or "202" in p.text:
-                                update_date_paragraph(p, current_date_en)
-                            elif "Identification Number." in p.text:
-                                replace_value_after_keyword(p, "Identification Number.", qti_no.strip())
-                            elif "Subject:" in p.text:
-                                replace_value_after_keyword(p, "Subject:", cover_data['subject'])
+                            if "Ref. No.:" in p.text: replace_value_after_keyword(p, "Ref. No.:", cover_data['tr_no'])
+                            elif "October" in p.text or "202" in p.text: update_date_paragraph(p, current_date_en)
+                            elif "Identification Number." in p.text: replace_value_after_keyword(p, "Identification Number.", qti_no.strip())
+                            elif "Subject:" in p.text: replace_value_after_keyword(p, "Subject:", cover_data['subject'])
 
             sync_footer_content(doc_en, qti_no.strip(), cover_data['subject'])
 
-            ref_idx = None
-            yours_idx = None
+            ref_idx, yours_idx = None, None
             for idx, p in enumerate(doc_en.paragraphs):
                 if "This has reference to the" in p.text:
                     p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-                    font_name = p.runs[0].font.name if (p.runs and p.runs[0].font.name) else "Times New Roman"
-                    font_size = p.runs[0].font.size if (p.runs and p.runs[0].font.size) else Pt(13)
+                    f_name = p.runs[0].font.name if (p.runs and p.runs[0].font.name) else "Times New Roman"
+                    f_size = p.runs[0].font.size if (p.runs and p.runs[0].font.size) else Pt(13)
                     p.clear()
                     r = p.add_run(f"This has reference to the {doc_type_en} {cover_data['tr_no']}, we would like to comment as follows:")
-                    r.font.name = font_name
-                    r.font.size = font_size
+                    r.font.name, r.font.size = f_name, f_size
                     ref_idx = idx
                 elif "Yours sincerely" in p.text:
-                    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                    yours_idx = idx
+                    p.alignment, yours_idx = WD_ALIGN_PARAGRAPH.LEFT, idx
                     break
 
             if ref_idx is not None and yours_idx is not None:
-                paras_to_remove = [doc_en.paragraphs[i] for i in range(ref_idx + 1, yours_idx)]
-                for p in paras_to_remove:
+                for p in [doc_en.paragraphs[i] for i in range(ref_idx + 1, yours_idx)]:
                     p._element.getparent().remove(p._element)
 
             target_p = None
@@ -975,74 +684,37 @@ async def export_zip_full(
 
             if target_p is not None:
                 if mode == "no_car_letter":
-                    if cover_data['docs']:
-                        for doc_k, d_info in reversed(list(cover_data['docs'].items())):
-                            new_p = target_p.insert_paragraph_before("")
-                            new_p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-                            new_p.paragraph_format.left_indent = Inches(0.35)
-                            new_p.paragraph_format.first_line_indent = Inches(-0.35)
-                            new_p.paragraph_format.space_before = 0
-                            new_p.paragraph_format.space_after = Pt(4)
-                            
-                            run = new_p.add_run(f"-\tThe document {d_info['doc_no']} {d_info['title']} Rev.{d_info['rev']} has been reviewed and found acceptable with no further comments.")
-                            run.font.name = 'Times New Roman'
-                            run.font.size = Pt(13)
-                    else:
+                    items_iter = reversed(list(cover_data['docs'].values())) if cover_data['docs'] else [{"doc_no": cover_data['tr_no'], "title": cover_data['subject']}]
+                    for it in items_iter:
                         new_p = target_p.insert_paragraph_before("")
                         new_p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-                        new_p.paragraph_format.left_indent = Inches(0.35)
-                        new_p.paragraph_format.first_line_indent = Inches(-0.35)
-                        new_p.paragraph_format.space_before = 0
-                        new_p.paragraph_format.space_after = Pt(4)
-                        doc_ref_word = "letter/proposal" if "-L-" in cover_data['tr_no'].upper() else "transmittal/documents"
-                        run = new_p.add_run(f"-\tWe have reviewed the submitted {doc_ref_word} and have no objection.")
-                        run.font.name = 'Times New Roman'
-                        run.font.size = Pt(13)
+                        new_p.paragraph_format.left_indent, new_p.paragraph_format.first_line_indent = Inches(0.35), Inches(-0.35)
+                        new_p.paragraph_format.space_before, new_p.paragraph_format.space_after = 0, Pt(4)
+                        if cover_data['docs']: txt = f"-\tThe document {it['doc_no']} {it['title']} Rev.{it['rev']} has been reviewed and found acceptable with no further comments."
+                        else: txt = f"-\tWe have reviewed the submitted transmittal/documents and have no objection."
+                        run = new_p.add_run(txt)
+                        run.font.name, run.font.size = 'Times New Roman', Pt(13)
                 else:
                     for item in reversed(processed_car_list):
                         new_p = target_p.insert_paragraph_before("")
                         new_p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-                        new_p.paragraph_format.left_indent = Inches(0.35)
-                        new_p.paragraph_format.first_line_indent = Inches(-0.35)
-                        new_p.paragraph_format.space_before = 0
-                        new_p.paragraph_format.space_after = Pt(4)
-                        
+                        new_p.paragraph_format.left_indent, new_p.paragraph_format.first_line_indent = Inches(0.35), Inches(-0.35)
+                        new_p.paragraph_format.space_before, new_p.paragraph_format.space_after = 0, Pt(4)
                         run = new_p.add_run(f"-\tThe document {item['doc_no']} {item['title']} Rev.{item['rev']} is {item['status']} indicated as per {item['car_label']}.")
-                        run.font.name = 'Times New Roman'
-                        run.font.size = Pt(13)
+                        run.font.name, run.font.size = 'Times New Roman', Pt(13)
 
             en_io = io.BytesIO()
             doc_en.save(en_io)
-            safe_qti_name = clean_safe_filename(qti_no)
-            zip_file.writestr(f"{safe_qti_name} {safe_subj_name}.docx", en_io.getvalue())
-            del en_io, doc_en
-
-        safe_qti_name = clean_safe_filename(qti_no)
-        headers = {
-            "Content-Disposition": f'attachment; filename="{safe_qti_name}.zip"'
-        }
-        
+            zip_file.writestr(f"{clean_safe_filename(qti_no)} {safe_subj_name}.docx", en_io.getvalue())
+            
+        headers = {"Content-Disposition": f'attachment; filename="{clean_safe_filename(qti_no)}.zip"'}
         try:
-            items_json = json.dumps([
-                {
-                    "doc_no": item['doc_no'],
-                    "assigned_car": item['assigned_car_name'],
-                    "status": item['status']
-                } for item in processed_car_list
-            ], ensure_ascii=False)
-            items_b64 = base64.b64encode(items_json.encode('utf-8')).decode('ascii')
-            if len(items_b64) < 6000:
-                headers["X-Processed-Items"] = items_b64
-        except Exception:
-            pass
+            items_json = json.dumps([{"doc_no": i['doc_no'], "assigned_car": i['assigned_car_name'], "status": i['status']} for i in processed_car_list], ensure_ascii=False)
+            b64_str = base64.b64encode(items_json.encode('utf-8')).decode('ascii')
+            if len(b64_str) < 6000: headers["X-Processed-Items"] = b64_str
+        except: pass
 
-        return FileResponse(
-            path=temp_zip_path,
-            media_type="application/zip",
-            filename=f"{safe_qti_name}.zip",
-            headers=headers,
-            background=BackgroundTask(remove_temp_file, temp_zip_path)
-        )
+        return FileResponse(path=temp_zip_path, media_type="application/zip", filename=f"{clean_safe_filename(qti_no)}.zip", headers=headers, background=BackgroundTask(remove_temp_file, temp_zip_path))
 
     except Exception as ge:
         remove_temp_file(temp_zip_path)
