@@ -20,7 +20,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 import pypdf
 from starlette.background import BackgroundTask
 
-app = FastAPI(title="QT1 Doc Control API - Master Locked Engine")
+app = FastAPI(title="QT1 Doc Control API - High Speed Master Engine")
 
 app.add_middleware(
     CORSMiddleware,
@@ -33,18 +33,13 @@ app.add_middleware(
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-
-# =========================================================================
-# MODULE 1: BỘ LỌC ĐỊNH DẠNG (ĐÃ KHÓA CỨNG - KHÔNG CHỈNH SỬA)
-# =========================================================================
-
 def clean_safe_filename(name: str) -> str:
     cleaned = re.sub(r'[\\/*?:"<>|]', '-', name).strip()
     return cleaned[:130] if len(cleaned) > 130 else cleaned
 
 def normalize_doc_code(raw: str) -> str:
     if not raw: return ""
-    m = re.search(r'(QT1-[A-Za-z0-9_-]+)', raw)
+    m = re.search(r'(QT1-[0-9L]-[A-Za-z0-9_-]+)', raw)
     if not m: return ""
     code = m.group(1).strip()
     code = re.sub(r'_(?:[A-Za-z0-9]{1,3}|Rev\.?[A-Za-z0-9]+)$', '', code, flags=re.IGNORECASE)
@@ -54,12 +49,9 @@ def normalize_doc_code(raw: str) -> str:
 def clean_document_title(raw_title: str) -> str:
     if not raw_title: return ""
     t = str(raw_title).strip()
-    # Xóa số chỉ mục La Mã/Số đếm bị dính ở đầu (VD: "iv ", "4 ")
     t = re.sub(r'^(?:iv|v|vi|vii|viii|ix|x|\d{1,2})\s+', '', t, flags=re.IGNORECASE).strip()
-    # Xóa các cụm trạng thái thừa ở cuối (VD: "(APD, Rev.0)", "(IFA)", "(APD, Rev.1~3)")
     t = re.sub(r'\s*\([A-Za-z0-9\s,.~-]*(?:APD|IFA|IFI|AB|RJ|Rev\.?|R\d)[A-Za-z0-9\s,.~-]*\)$', '', t, flags=re.IGNORECASE).strip()
     t = re.sub(r'VoltageTransformer', 'Voltage Transformer', t, flags=re.IGNORECASE)
-    # Loại bỏ nếu chỉ còn lại 1 chữ số hoặc 1 mã rác
     if re.match(r'^(?:iv|v|vi|vii|viii|ix|x|\d{1,2})$', t, re.IGNORECASE):
         return ""
     return t
@@ -92,14 +84,16 @@ def extract_cover_date_bulletproof(text: str) -> str:
             d_val = int(g[0] + g[1])
             m_val = int(g[2] + g[3])
             y_val = g[4] + g[5] + g[6] + g[7]
-            if 1 <= m_val <= 12 and 1 <= d_val <= 31: return f"{d_val:02d}/{m_val:02d}/{y_val}"
+            if 1 <= m_val <= 12 and 1 <= d_val <= 31:
+                return f"{d_val:02d}/{m_val:02d}/{y_val}"
 
         m_slash = re.search(r'[:\s-]*\s*(\d{1,2})[\/.-](\d{1,2})[\/.-](202\d)', snippet_clean)
         if m_slash:
             d_val = int(m_slash.group(1))
             m_val = int(m_slash.group(2))
             y_val = m_slash.group(3)
-            if 1 <= m_val <= 12 and 1 <= d_val <= 31: return f"{d_val:02d}/{m_val:02d}/{y_val}"
+            if 1 <= m_val <= 12 and 1 <= d_val <= 31:
+                return f"{d_val:02d}/{m_val:02d}/{y_val}"
 
         collapsed = re.sub(r'\s+', ' ', snippet_clean).strip()
         m_en = re.search(r'\b(' + month_pat + r')\s*(\d{1,2})\s*,?\s*(202\s*\d)', collapsed, re.IGNORECASE)
@@ -107,44 +101,36 @@ def extract_cover_date_bulletproof(text: str) -> str:
             mon_str = m_en.group(1).lower()
             d_val = int(m_en.group(2))
             y_val = re.sub(r'\s+', '', m_en.group(3))
-            if mon_str in month_map and 1 <= d_val <= 31: return f"{d_val:02d}/{month_map[mon_str]:02d}/{y_val}"
+            if mon_str in month_map and 1 <= d_val <= 31:
+                return f"{d_val:02d}/{month_map[mon_str]:02d}/{y_val}"
 
     return ""
 
 def extract_cover_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
-    all_reconstructed_lines = []
-    full_text_simple = []
+    docs = {}
+    full_text_pages = []
     
     try:
-        reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
-        for p in reader.pages:
-            t = p.extract_text()
-            if t: full_text_simple.append(t)
-            
-            # Quét tọa độ Y để chống ngắt dòng
-            lines_by_y = {}
-            def visitor_body(text, cm, tm, fontDict, fontSize):
-                if text and text.strip():
-                    y = round(tm[5] / 3.0) * 3.0
-                    lines_by_y.setdefault(y, []).append((tm[4], text.strip()))
-            try:
-                p.extract_text(visitor_text=visitor_body)
-                for y in sorted(lines_by_y.keys(), reverse=True):
-                    row_parts = [item[1] for item in sorted(lines_by_y[y], key=lambda x: x[0])]
-                    all_reconstructed_lines.append(" ".join(row_parts))
-            except: pass
+        reader = pypdf.PdfReader(io.BytesIO(pdf_bytes), strict=False)
+        for page in reader.pages:
+            t = page.extract_text()
+            if t:
+                full_text_pages.append(t)
     except Exception as e:
         print(f"pypdf reader error: {e}")
         
-    full_text = "\n".join(full_text_simple)
+    full_text = "\n".join(full_text_pages)
 
     tr_no = ""
     m_fn = re.search(r'(QT1-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+)', filename)
-    if m_fn: tr_no = m_fn.group(1).strip()
+    if m_fn:
+        tr_no = m_fn.group(1).strip()
     if not tr_no:
         m_ref = re.search(r'(?:TR\.?\s*No\.?|Ref\.?)\s*[:\s]*([A-Za-z0-9_-]*QT1[A-Za-z0-9_-]+)', full_text, re.IGNORECASE)
-        if m_ref and "EVNPMB2" not in m_ref.group(1): tr_no = m_ref.group(1).strip()
-    if not tr_no: tr_no = "QT1-Transmittal"
+        if m_ref and "EVNPMB2" not in m_ref.group(1):
+            tr_no = m_ref.group(1).strip()
+    if not tr_no:
+        tr_no = "QT1-Transmittal"
 
     date_str = extract_cover_date_bulletproof(full_text)
 
@@ -152,16 +138,17 @@ def extract_cover_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
     m_sub = re.search(r'(?:SUBJECT|Subject)\s*[:\s]+([^\n\r]+)', full_text, re.IGNORECASE)
     if m_sub:
         raw_sub = m_sub.group(1).strip()
-        subject = re.split(r'(?:Reference|Dear|Attn|Attachment|Document/Drawing|Sheet:)', raw_sub, flags=re.IGNORECASE)[0].strip()
-    if not subject: subject = "Official Transmittal"
+        raw_sub = re.split(r'(?:Reference|Dear|Attn|Attachment|Document/Drawing|Sheet:)', raw_sub, flags=re.IGNORECASE)[0].strip()
+        subject = raw_sub
+    if not subject:
+        subject = "Official Transmittal"
 
-    all_lines_to_check = all_reconstructed_lines + full_text.splitlines()
-    docs = {}
+    lines = full_text.splitlines()
     purpose_markers = {'IFA', 'IFI', 'APD', 'AB', 'RI', 'END', '- END -', '-END-', '-'}
     
     i = 0
-    while i < len(all_lines_to_check):
-        line = all_lines_to_check[i].strip()
+    while i < len(lines):
+        line = lines[i].strip()
         m_doc = re.search(r'(QT1-[0-9L]-[A-Za-z0-9_-]+)', line)
         if m_doc and "EVNPMB2" not in m_doc.group(1) and "QT1-HDH" not in m_doc.group(1):
             raw_code = m_doc.group(1).strip()
@@ -169,8 +156,10 @@ def extract_cover_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
             after = line[m_doc.end():].strip()
             
             words = after.split()
-            while words and words[-1].upper() in purpose_markers: words.pop()
-            while words and words[-1] in ['-', 'END']: words.pop()
+            while words and words[-1].upper() in purpose_markers:
+                words.pop()
+            while words and words[-1] in ['-', 'END']:
+                words.pop()
                 
             rev = "1"
             if len(words) >= 2 and words[0].isdigit() and (len(words[1]) <= 3 and words[1].isalnum() and not words[1].isdigit()):
@@ -185,21 +174,25 @@ def extract_cover_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
                 
             title_parts = [ " ".join(words).strip() ]
             
-            # Quét gom dòng bị ngắt
             j = i + 1
-            while j < len(all_lines_to_check):
-                next_line = all_lines_to_check[j].strip()
+            while j < len(lines):
+                next_line = lines[j].strip()
                 if re.search(r'(QT1-[0-9L]-[A-Za-z0-9_-]+)', next_line) or re.match(r'^\d{1,2}\s+', next_line) or "Purpose:" in next_line:
                     break
                 if next_line and not any(k in next_line for k in ["Sheet:", "Date:", "Page", "END -"]):
                     clean_next = " ".join([w for w in next_line.split() if w.upper() not in purpose_markers])
-                    if clean_next: title_parts.append(clean_next)
+                    if clean_next:
+                        title_parts.append(clean_next)
                 j += 1
                 
             combined_title = clean_document_title(" ".join(title_parts))
             
-            if norm_code and combined_title and combined_title.lower() != subject.lower():
-                docs[norm_code] = {'doc_no': norm_code, 'rev': rev, 'title': combined_title}
+            if norm_code and combined_title:
+                docs[norm_code] = {
+                    'doc_no': norm_code,
+                    'rev': rev,
+                    'title': combined_title
+                }
         i += 1
 
     return {
@@ -209,10 +202,6 @@ def extract_cover_metadata(pdf_bytes: bytes, filename: str = "") -> dict:
         'docs': docs
     }
 
-# =========================================================================
-# MODULE 2: HÀM TIỆN ÍCH WORD/EXCEL
-# =========================================================================
-
 def find_template(prefix):
     search_dirs = [BASE_DIR, os.getcwd(), r"G:\Shared drives\Test auto"]
     for d in search_dirs:
@@ -221,7 +210,8 @@ def find_template(prefix):
             if f.lower().endswith(".docx"):
                 clean_f = f.lower().replace("đ", "d").replace("ð", "d")
                 clean_p = prefix.lower().replace("đ", "d").replace("ð", "d")
-                if clean_p in clean_f and not f.startswith("~$"): return os.path.join(d, f)
+                if clean_p in clean_f and not f.startswith("~$"):
+                    return os.path.join(d, f)
     return None
 
 def find_car_template():
@@ -292,9 +282,9 @@ def replace_value_after_keyword(paragraph, keyword, new_text):
             paragraph.text = f"{keyword} {new_text}"
             return True
         kw_font = paragraph.runs[0].font
-        kw_name, kw_size, kw_bold, kw_italic = kw_font.name, kw_font.size, kw_font.bold, kw_font.italic
+        kw_name, kw_size, kw_bold, kw_italic = kw_font.name, kw_font.size, kw_font.bold, kw_italic
         val_font = paragraph.runs[-1].font
-        val_name, val_size, val_bold, val_italic = val_font.name, val_font.size, val_font.bold, val_font.italic
+        val_name, val_size, val_bold, val_italic = val_font.name, val_font.size, val_bold, val_italic
         
         paragraph.clear()
         r1 = paragraph.add_run(keyword)
@@ -306,7 +296,7 @@ def replace_value_after_keyword(paragraph, keyword, new_text):
 
 def update_date_paragraph(paragraph, new_date_str):
     val_font = paragraph.runs[-1].font
-    val_name, val_size, val_bold, val_italic = val_font.name, val_font.size, val_font.bold, val_font.italic
+    val_name, val_size, val_bold, val_italic = val_font.name, val_font.size, val_bold, val_italic
     paragraph.clear()
     paragraph.add_run("                                ")
     r2 = paragraph.add_run(new_date_str)
@@ -332,16 +322,12 @@ def remove_temp_file(path: str):
         if os.path.exists(path): os.remove(path)
     except: pass
 
-# =========================================================================
-# MODULE 3: ĐỘNG CƠ XỬ LÝ CHÍNH
-# =========================================================================
-
 @app.post("/api/export-zip-full")
 async def export_zip_full(
     files: list[UploadFile] = File(default=[]),
     cover_file: UploadFile = File(None),
     metadata: str = Form("{}"),
-    mode: str = Form("auto_generate_cars"),
+    mode: str = Form("auto_bump"),
     qti_no: str = Form("QTI-PECC1-PMB2-26-10-155"),
     start_car_no: str = Form("9905"),
     custom_date: str = Form(""),
@@ -376,14 +362,14 @@ async def export_zip_full(
         vi_template_path = find_template("TV")
         en_template_path = find_template("QTI-PECC1")
         if not vi_template_path or not en_template_path: 
-            raise FileNotFoundError("Thiếu file Word mẫu (TVÐ1-NÐNLM.docx / QTI-PECC1.docx) trong server.")
+            raise FileNotFoundError("Thiếu file Word mẫu (TVÐ1-NÐNLM.docx / QTI-PECC1.docx) trong máy chủ.")
 
         processed_car_list = []
         start_num = int(re.sub(r'\D', '', str(start_car_no)) or "9905")
 
         with zipfile.ZipFile(temp_zip_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
             
-            # --- LUỒNG 1: TỰ ĐỘNG TẠO CAR MỚI ---
+            # 1. TỰ ĐỘNG TẠO CAR
             if mode == "auto_generate_cars":
                 docs_to_generate = list(cover_data['docs'].values()) if cover_data['docs'] else [{'doc_no': cover_data['tr_no'], 'rev': 'A', 'title': cover_data['subject']}]
                 status_full = "APPROVED (APP)" if default_status == "APP" else "RETURN FOR CORRECTIONS (RFC)"
@@ -428,12 +414,13 @@ async def export_zip_full(
                         'status': status_full, 'car_label': f"{car_base} R1", 'assigned_car_name': new_excel_name
                     })
 
-            # --- LUỒNG 2: XỬ LÝ CÁC FILE CAR ĐÃ TẢI LÊN ---
+            # 2. XỬ LÝ HÀNG LOẠT FILE TẢI LÊN
             elif mode != "no_car_letter" and files:
                 for file_idx, file in enumerate(files):
                     try:
                         content = await file.read()
                         wb = openpyxl.load_workbook(io.BytesIO(content))
+                        
                         for ws_item in wb.worksheets:
                             if hasattr(ws_item, 'sheet_properties') and ws_item.sheet_properties and hasattr(ws_item.sheet_properties, 'pageSetUpPr'):
                                 ws_item.sheet_properties.pageSetUpPr.fitToPage = None
@@ -448,7 +435,6 @@ async def export_zip_full(
 
                         source_ws = wb.worksheets[target_idx]
                         
-                        # Identify columns
                         prev_com_col, prev_rep_col = None, None
                         for c in range(1, source_ws.max_column + 1):
                             val_h = str(source_ws.cell(row=11, column=c).value or "").upper()
@@ -456,29 +442,30 @@ async def export_zip_full(
                             elif f"ROUND {max_r} REPLIES" in val_h: prev_rep_col = c
                         if not prev_com_col: prev_com_col = 7
 
-                        # XÁC ĐỊNH MÃ DOC NO VÀ TITLE (3-TIER HIERARCHY LÀM SẠCH)
+                        # BÓC TÁCH MÃ DOC VÀ TÊN (3-TIER HIERARCHY CHỐNG SAI LỆCH)
                         detected_doc_code = ""
                         for c in range(3, source_ws.max_column + 1):
                             v_c = str(source_ws.cell(row=4, column=c).value or "")
                             if "QT1-" in v_c:
                                 detected_doc_code = normalize_doc_code(v_c)
                                 break
-                        if not detected_doc_code: detected_doc_code = normalize_doc_code(file.filename)
+                        if not detected_doc_code: 
+                            detected_doc_code = normalize_doc_code(file.filename)
 
                         cover_info = cover_data['docs'].get(detected_doc_code, {})
                         final_doc_no = cover_info.get('doc_no', detected_doc_code if detected_doc_code else "QT1-Document")
                         final_rev = cover_info.get('rev', '1')
 
-                        # Ưu tiên 1: Lấy từ Cover nếu có (Và không bị lấy nhầm Subject)
+                        # Ưu tiên 1: Lấy từ Transmittal nếu có
                         if cover_info.get('title') and cover_info['title'].lower() != cover_data['subject'].lower():
                             final_title = cover_info['title']
                         else:
-                            # Ưu tiên 2: Tên file
+                            # Ưu tiên 2: Lấy từ Tên file CaR kỹ sư tải lên
                             title_from_fn = extract_title_from_filename(file.filename)
                             if title_from_fn:
                                 final_title = title_from_fn
                             else:
-                                # Ưu tiên 3: Tên ở ô G5 của Round cũ
+                                # Ưu tiên 3: Lấy từ ô G5 của Round cũ đã làm sạch
                                 r5_val = clean_document_title(str(source_ws.cell(row=5, column=prev_com_col).value or ""))
                                 final_title = r5_val if r5_val else cover_data['subject']
 
@@ -486,6 +473,8 @@ async def export_zip_full(
                         car_num_str = f"{cur_num:04d}" if cur_num < 10000 else f"{cur_num}"
                         car_base = f"{car_num_str} CaRs"
 
+                        # =======================================================
+                        # CHẾ ĐỘ: CẤP SỐ CHO CAR KỸ SƯ
                         # =======================================================
                         if mode == "number_filled_cars":
                             detected_status_raw = "APPROVED (APP)"
@@ -528,6 +517,8 @@ async def export_zip_full(
                             })
 
                         # =======================================================
+                        # CHẾ ĐỘ: NÂNG ROUND (R+1) SIÊU TỐC
+                        # =======================================================
                         elif mode == "auto_bump":
                             selected_status = car_metadata.get(file.filename, "APP")
                             new_r_num = max_r + 1
@@ -564,11 +555,13 @@ async def export_zip_full(
                             new_ws.column_dimensions[openpyxl.utils.get_column_letter(new_com_col)].width = 38
                             new_ws.column_dimensions[openpyxl.utils.get_column_letter(new_rep_col)].width = 38
 
+                            # Duyệt tối ưu các hàng nhận xét
                             limit_row = min(new_ws.max_row, 100)
                             for r in range(14, limit_row + 1):
                                 v_prev_c = str(new_ws.cell(row=r, column=prev_com_col).value or "").strip()
                                 if v_prev_c and not ("general comment" in v_prev_c.lower() or "detailed comment" in v_prev_c.lower()):
-                                    if selected_status == "APP": new_ws.cell(row=r, column=new_com_col).value = "Noted."
+                                    if selected_status == "APP": 
+                                        new_ws.cell(row=r, column=new_com_col).value = "Noted."
 
                             new_excel_name = f"{car_base} R{new_r_num} {current_date_str} {final_doc_no} {clean_safe_filename(final_title)} rev.{final_rev}.xlsx"
                             excel_out = io.BytesIO()
@@ -581,6 +574,8 @@ async def export_zip_full(
                                 'status': status_full, 'car_label': f"{car_base} R{new_r_num}", 'assigned_car_name': new_excel_name
                             })
 
+                        # =======================================================
+                        # CHẾ ĐỘ: TRÍCH XUẤT CAR CÓ SẴN
                         # =======================================================
                         elif mode == "pre_prepared":
                             status_full = "APPROVED (APP)"
@@ -605,7 +600,7 @@ async def export_zip_full(
                     except Exception as fe:
                         print(f"Lỗi tệp {file.filename}: {fe}")
 
-            # --- LUỒNG 3: TRẢ LỜI CÔNG VĂN (KHÔNG KÈM CAR) ---
+            # 3. TRẢ LỜI THƯ THUẦN TÚY (KHÔNG KÈM CAR)
             elif mode == "no_car_letter":
                 if cover_data['docs']:
                     for doc_k, d_info in reversed(list(cover_data['docs'].items())):
