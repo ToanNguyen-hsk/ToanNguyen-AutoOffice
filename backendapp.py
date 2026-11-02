@@ -1,15 +1,15 @@
 import base64
 from copy import copy
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import gc
 import io
 import json
 import os
 import re
 import tempfile
+import time
 import traceback
 import zipfile
-import zlib
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Inches, Pt, RGBColor
@@ -29,10 +29,12 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["Content-Disposition", "X-Processed-Items"],
+    expose_headers=["Content-Disposition", "X-Processed-Items", "X-Cover-Info"],
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Máy chủ (Render) chạy giờ UTC -> ép về giờ Việt Nam để ngày phát hành không bị lệch
+VN_TZ = timezone(timedelta(hours=7))
 
 
 def clean_safe_filename(name: str) -> str:
@@ -51,16 +53,19 @@ def normalize_doc_code(raw: str) -> str:
       r"_(?:[A-Za-z0-9]{1,3}|Rev\.?[A-Za-z0-9]+)$", "", code, flags=re.IGNORECASE
   )
   code = re.sub(r"[\s_]+rev\.?.*$", "", code, flags=re.IGNORECASE)
-  return code
+  return code.rstrip("-_")
 
 
-def clean_document_title(raw_title: str) -> str:
+def clean_document_title(raw_title: str, strip_index: bool = True) -> str:
+  """strip_index=False khi dữ liệu đã tách đúng cột (PDF/Excel) -> không cắt nhầm
+  số/chữ đầu tiêu đề như "33 kV ..." hay "V ..."."""
   if not raw_title:
     return ""
   t = str(raw_title).strip()
-  t = re.sub(
-      r"^(?:iv|v|vi|vii|viii|ix|x|\d{1,2})\s+", "", t, flags=re.IGNORECASE
-  ).strip()
+  if strip_index:
+    t = re.sub(
+        r"^(?:iv|v|vi|vii|viii|ix|x|\d{1,2})\s+", "", t, flags=re.IGNORECASE
+    ).strip()
   t = re.sub(
       r"\s*\([A-Za-z0-9\s,.~-]*(?:APD|IFA|IFI|AB|RJ|Rev\.?|R\d)[A-Za-z0-9\s,.~-]*\)$",
       "",
@@ -94,120 +99,674 @@ def extract_title_from_filename(filename: str) -> str:
 
 
 def extract_cover_date_bulletproof(text: str) -> str:
-  month_map = {
-      "jan": 1,
-      "january": 1,
-      "feb": 2,
-      "february": 2,
-      "mar": 3,
-      "march": 3,
-      "apr": 4,
-      "april": 4,
-      "may": 5,
-      "jun": 6,
-      "june": 6,
-      "jul": 7,
-      "july": 7,
-      "aug": 8,
-      "august": 8,
-      "sep": 9,
-      "september": 9,
-      "sept": 9,
-      "oct": 10,
-      "october": 10,
-      "nov": 11,
-      "november": 11,
-      "dec": 12,
-      "december": 12,
-  }
-  month_pat = r"(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)"
-
-  m_date = re.search(r"\bDate\b", text, re.IGNORECASE)
-  if m_date:
-    snippet = text[m_date.end() : m_date.end() + 120]
-    snippet_clean = re.sub(
-        r"Day\s*Mon\s*Year", "", snippet, flags=re.IGNORECASE
-    )
-    snippet_clean = re.sub(
-        r"Sheet\s*:\s*\d+\s*of\s*\d+", "", snippet_clean, flags=re.IGNORECASE
-    )
-
-    m_8digits = re.search(
-        r"[:\s-]*\s*(\d)\s*(\d)\s*(\d)\s*(\d)\s*(2)\s*(0)\s*(2)\s*(\d)",
-        snippet_clean,
-    )
-    if m_8digits:
-      g = m_8digits.groups()
-      d_val = int(g[0] + g[1])
-      m_val = int(g[2] + g[3])
-      y_val = g[4] + g[5] + g[6] + g[7]
-      if 1 <= m_val <= 12 and 1 <= d_val <= 31:
-        return f"{d_val:02d}/{m_val:02d}/{y_val}"
-
-    m_slash = re.search(
-        r"[:\s-]*\s*(\d{1,2})[\/.-](\d{1,2})[\/.-](202\d)", snippet_clean
-    )
-    if m_slash:
-      d_val = int(m_slash.group(1))
-      m_val = int(m_slash.group(2))
-      y_val = m_slash.group(3)
-      if 1 <= m_val <= 12 and 1 <= d_val <= 31:
-        return f"{d_val:02d}/{m_val:02d}/{y_val}"
-
-    collapsed = re.sub(r"\s+", " ", snippet_clean).strip()
-    m_en = re.search(
-        r"\b(" + month_pat + r")\s*(\d{1,2})\s*,?\s*(202\s*\d)",
-        collapsed,
-        re.IGNORECASE,
-    )
-    if m_en:
-      mon_str = m_en.group(1).lower()
-      d_val = int(m_en.group(2))
-      y_val = re.sub(r"\s+", "", m_en.group(3))
-      if mon_str in month_map and 1 <= d_val <= 31:
-        return f"{d_val:02d}/{month_map[mon_str]:02d}/{y_val}"
-
+  """Đọc ngày từ một đoạn text bất kỳ. Thử MỌI vị trí chữ 'Date', không chỉ cái đầu tiên."""
+  if not text:
+    return ""
+  for m_date in re.finditer(r"\bDate\b", text, re.IGNORECASE):
+    d = _parse_date_snippet(text[m_date.end() : m_date.end() + 120])
+    if d:
+      return d
   return ""
 
 
-def extract_cover_metadata_fast(pdf_bytes: bytes, filename: str = "") -> dict:
-  """Bộ đọc PDF an toàn, chống treo tuyệt đối khi gặp tệp PDF bị lỗi con trỏ xref."""
-  full_text_list = []
+# =============================================================================
+# ĐỌC PDF COVER (TRANSMITTAL) THEO TOẠ ĐỘ: DÒNG -> CỘT -> Ô BẢNG
+# =============================================================================
+CODE_RE = re.compile(r"(QT1-[0-9L]-[A-Za-z0-9_-]+)")
+# Rev hợp lệ: 1 chữ (+1 số) hoặc 1-2 số (+1 chữ), có thể kèm tiền tố "Rev."
+# -> không còn "ăn nhầm" từ đầu của tiêu đề như CT, No, kV...
+REV_RE = re.compile(r"^(?:Rev\.?)?([A-Za-z]\d?|\d{1,2}[A-Za-z]?)$", re.IGNORECASE)
+PURPOSE_MARKERS = {"IFA", "IFI", "APD", "AB", "RI", "END", "-END-", "-"}
+STOP_LINE_RE = re.compile(
+    r"(Sheet\s*:|Date\s*:|Page\s+\d|END\s*-|-\s*END|Purpose\s*:|Prepared by|Remarks?\s*:)",
+    re.IGNORECASE,
+)
+SUBJECT_END_RE = re.compile(
+    r"^\W*(Reference|Ref\b|Dear|Attn|Attachment|Document|To\b|From\b|Cc\b|Date\b)",
+    re.IGNORECASE,
+)
+MAX_PDF_PAGES = 30
+MONTH3 = {
+    m: i
+    for i, m in enumerate(
+        ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"],
+        1,
+    )
+}
+MONTH_PAT = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?"
 
-  # Cách 1: Giải mã luồng FlateDecode nhị phân trực tiếp (tốc độ < 0.1s, không phụ thuộc xref)
+
+def _ok_dmy(d, m, y):
+  return 1 <= d <= 31 and 1 <= m <= 12 and 2000 <= y <= 2099
+
+
+def _parse_date_snippet(snippet: str) -> str:
+  """Nhận một đoạn text ngay sau nhãn 'Date' và trả về dd/mm/yyyy (hoặc '')."""
+  s = re.sub(r"Day\s*Mon(?:th)?\s*Year", " ", snippet or "", flags=re.IGNORECASE)
+  s = re.sub(r"Sheet\s*:?\s*\d+\s*of\s*\d+", " ", s, flags=re.IGNORECASE)
+
+  # 05/10/2026, 5-10-2026, 05.10.2026
+  m = re.search(r"(?<!\d)(\d{1,2})\s*[/.\-]\s*(\d{1,2})\s*[/.\-]\s*(20\d\d)(?!\d)", s)
+  if m:
+    d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if _ok_dmy(d, mo, y):
+      return f"{d:02d}/{mo:02d}/{y}"
+
+  # Ô số rời: 0 5 1 0 2 0 2 6  hoặc  05 10 2026
+  m = re.search(r"(?<!\d)(\d)\s*(\d)\s*(\d)\s*(\d)\s*(2)\s*(0)\s*(\d)\s*(\d)(?!\d)", s)
+  if m:
+    g = m.groups()
+    d, mo, y = int(g[0] + g[1]), int(g[2] + g[3]), int("".join(g[4:]))
+    if _ok_dmy(d, mo, y):
+      return f"{d:02d}/{mo:02d}/{y}"
+
+  # October 05, 2026
+  m = re.search(
+      r"\b(" + MONTH_PAT + r")\s*(\d{1,2})(?:st|nd|rd|th)?\s*,?\s*(20\s*\d\s*\d)",
+      s,
+      re.IGNORECASE,
+  )
+  if m:
+    mo = MONTH3.get(m.group(1)[:3].lower(), 0)
+    d, y = int(m.group(2)), int(re.sub(r"\s+", "", m.group(3)))
+    if _ok_dmy(d, mo, y):
+      return f"{d:02d}/{mo:02d}/{y}"
+
+  # 05 Oct 2026
+  m = re.search(
+      r"(?<!\d)(\d{1,2})(?:st|nd|rd|th)?[\s\-/.]*(" + MONTH_PAT + r")[\s\-/.,]*(20\s*\d\s*\d)",
+      s,
+      re.IGNORECASE,
+  )
+  if m:
+    mo = MONTH3.get(m.group(2)[:3].lower(), 0)
+    d, y = int(m.group(1)), int(re.sub(r"\s+", "", m.group(3)))
+    if _ok_dmy(d, mo, y):
+      return f"{d:02d}/{mo:02d}/{y}"
+  return ""
+
+
+# ----------------------------- nạp trang PDF ---------------------------------
+def _ocr_pages(pdf_bytes: bytes, max_pages: int = 4) -> list:
+  """PDF scan (không có lớp chữ): OCR vài trang đầu nếu máy chủ có pytesseract."""
   try:
-    for m in re.finditer(
-        rb"stream[\r\n]+([\s\S]*?)[\r\n]+endstream", pdf_bytes
-    ):
-      try:
-        decomp = zlib.decompress(m.group(1))
-        dec_str = decomp.decode("latin1", errors="ignore")
-        # Trích xuất các chuỗi text trong PDF: (Text) Tj
-        for tj in re.finditer(rb"\(([\s\S]*?)\)\s*Tj", decomp):
-          full_text_list.append(tj.group(1).decode("latin1", errors="ignore"))
-        full_text_list.append(dec_str)
-      except Exception:
-        pass
+    import pdfplumber
+    import pytesseract
   except Exception:
-    pass
+    return []
+  out = []
+  try:
+    dpi = 200
+    k = 72.0 / dpi
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+      for page in pdf.pages[:max_pages]:
+        img = page.to_image(resolution=dpi).original
+        d = pytesseract.image_to_data(
+            img, lang="eng", config="--psm 6", output_type=pytesseract.Output.DICT
+        )
+        words = []
+        for i, t in enumerate(d["text"]):
+          t = (t or "").strip()
+          if t and float(d["conf"][i]) >= 0:
+            words.append({
+                "t": t,
+                "x0": d["left"][i] * k,
+                "x1": (d["left"][i] + d["width"][i]) * k,
+                "top": d["top"][i] * k,
+                "bottom": (d["top"][i] + d["height"][i]) * k,
+            })
+        out.append({"words": words, "tables": [], "ocr": True})
+  except Exception as e:
+    print(f"OCR bỏ qua: {e}")
+    return []
+  return out
 
-  # Cách 2: Bổ trợ pypdf với chế độ bắt lỗi nhanh
+
+def _load_pages(pdf_bytes: bytes) -> list:
+  """Mỗi trang: {'words': [{t,x0,x1,top,bottom}], 'tables': [[row,...]], 'ocr': bool}."""
+  pages = []
+  try:
+    import pdfplumber
+
+    t0 = time.monotonic()
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+      for page in pdf.pages[:MAX_PDF_PAGES]:
+        words = [
+            {"t": w["text"], "x0": w["x0"], "x1": w["x1"], "top": w["top"], "bottom": w["bottom"]}
+            for w in page.extract_words(x_tolerance=2, y_tolerance=2, keep_blank_chars=False)
+        ]
+        tables = []
+        if time.monotonic() - t0 < 25:  # chống treo với PDF quá nặng
+          try:
+            for tb in page.find_tables():
+              rows = tb.extract()
+              if rows:
+                tables.append(rows)
+          except Exception as te:
+            print(f"find_tables bỏ qua: {te}")
+        pages.append({"words": words, "tables": tables, "ocr": False})
+  except Exception as e:
+    print(f"pdfplumber không đọc được (dùng pypdf): {e}")
+    pages = []
+  if not any(p["words"] for p in pages):
+    ocr = _ocr_pages(pdf_bytes)
+    if ocr:
+      return ocr
+  return pages
+
+
+def _pypdf_text(pdf_bytes: bytes) -> str:
   try:
     reader = pypdf.PdfReader(io.BytesIO(pdf_bytes), strict=False)
-    for p in reader.pages:
-      t = p.extract_text()
-      if t:
-        full_text_list.append(t)
+    return "\n".join((p.extract_text() or "") for p in reader.pages[:MAX_PDF_PAGES])
   except Exception as pe:
     print(f"pypdf reader caught warning/error (safely bypassed): {pe}")
+    return ""
 
-  full_text = "\n".join(full_text_list)
+
+# ------------------------------ gom dòng -------------------------------------
+def _finish_line(ln):
+  ln["words"].sort(key=lambda w: w["x0"])
+  ln["top"] = min(w["top"] for w in ln["words"])
+  ln["bottom"] = max(w["bottom"] for w in ln["words"])
+  ln["text"] = " ".join(w["t"] for w in ln["words"])
+  return ln
+
+
+def _group_lines(words: list) -> list:
+  """Gom từ thành dòng theo toạ độ Y (tâm dòng), rồi sắp theo X."""
+  items = sorted(words, key=lambda w: ((w["top"] + w["bottom"]) / 2, w["x0"]))
+  lines = []
+  for w in items:
+    cy = (w["top"] + w["bottom"]) / 2
+    h = max(w["bottom"] - w["top"], 1)
+    if lines and abs(cy - lines[-1]["cy"]) <= max(2.5, 0.45 * h):
+      ln = lines[-1]
+      ln["words"].append(w)
+      ln["cy"] = sum((x["top"] + x["bottom"]) / 2 for x in ln["words"]) / len(ln["words"])
+    else:
+      lines.append({"words": [w], "cy": cy})
+  return [_finish_line(ln) for ln in lines]
+
+
+def _text_to_pseudo_lines(text: str) -> list:
+  """Dùng khi chỉ có text phẳng (pypdf): tạo toạ độ giả để dùng chung thuật toán."""
+  lines = []
+  for idx, raw in enumerate(text.splitlines()):
+    s = raw.strip()
+    if not s:
+      continue
+    words, pos = [], 0
+    for tok in s.split():
+      words.append({
+          "t": tok,
+          "x0": pos * 5.0,
+          "x1": (pos + len(tok)) * 5.0,
+          "top": idx * 12.0,
+          "bottom": idx * 12.0 + 10,
+      })
+      pos += len(tok) + 1
+    lines.append(_finish_line({"words": words, "cy": idx * 12.0 + 5}))
+  return lines
+
+
+# ------------------------------ Ngày / Subject -------------------------------
+def _find_date_in_lines(lines: list) -> str:
+  """Tìm nhãn 'Date' rồi chỉ đọc vùng ngay bên phải và 2 dòng bên dưới nhãn đó."""
+  for i, ln in enumerate(lines):
+    for w in ln["words"]:
+      if not re.fullmatch(r"date\s*:?", w["t"], re.IGNORECASE):
+        continue
+      parts = []
+      for j in range(i, min(i + 3, len(lines))):
+        L = lines[j]
+        if j > i and L["top"] - lines[i]["bottom"] > 45:
+          break
+        if j == i:
+          ws = [x for x in L["words"] if x["x0"] >= w["x1"] - 1]
+        else:
+          ws = [x for x in L["words"] if x["x1"] >= w["x0"] - 6]
+        kept = []
+        for x in ws:
+          if re.match(r"sheet", x["t"], re.IGNORECASE):
+            break  # không đọc sang ô 'Sheet: 1 of 2' bên cạnh
+          kept.append(x["t"])
+        parts.append(" ".join(kept))
+        d = _parse_date_snippet(" ".join(parts))
+        if d:
+          return d
+  return ""
+
+
+def _find_subject_in_lines(lines: list) -> str:
+  """Subject có thể xuống nhiều dòng: đọc tiếp các dòng cùng cột cho tới khi gặp nhãn khác."""
+  for i, ln in enumerate(lines):
+    for w in ln["words"]:
+      if not re.fullmatch(r"subject\s*:?", w["t"], re.IGNORECASE):
+        continue
+      first = []
+      for x in ln["words"]:
+        if x["x0"] < w["x1"] - 1:
+          continue
+        if re.match(r"sheet", x["t"], re.IGNORECASE):
+          break
+        first.append(x)
+      left = first[0]["x0"] if first else w["x0"]
+      parts = [" ".join(x["t"] for x in first)]
+      prev_bottom, lh = ln["bottom"], max(ln["bottom"] - ln["top"], 8)
+      for j in range(i + 1, min(i + 6, len(lines))):
+        L = lines[j]
+        if L["top"] - prev_bottom > 1.8 * lh or SUBJECT_END_RE.match(L["text"]):
+          break
+        kept = []
+        for x in L["words"]:
+          if x["x0"] < left - 8:
+            continue
+          if re.match(r"sheet", x["t"], re.IGNORECASE):
+            break
+          kept.append(x["t"])
+        if not kept:
+          break
+        parts.append(" ".join(kept))
+        prev_bottom = L["bottom"]
+      subj = re.split(
+          r"(?:Reference|Dear|Attn|Attachment|Document/Drawing|Sheet:)",
+          " ".join(parts),
+          flags=re.IGNORECASE,
+      )[0]
+      subj = re.sub(r"\s+", " ", subj).strip(" :-")
+      if subj:
+        return subj
+  return ""
+
+
+# --------------------------- tách Rev / Tiêu đề ------------------------------
+def _split_rev_title(tokens: list):
+  """tokens = các từ đứng sau mã tài liệu. Trả về (rev, tokens_tiêu_đề)."""
+  if not tokens:
+    return "1", []
+  if (
+      len(tokens) >= 2
+      and tokens[0].isdigit()
+      and not tokens[1].isdigit()
+      and REV_RE.match(tokens[1])
+  ):
+    return REV_RE.match(tokens[1]).group(1).upper(), tokens[2:]
+  m = REV_RE.match(tokens[0])
+  if m:
+    return m.group(1).upper(), tokens[1:]
+  return "1", tokens
+
+
+def _rev_from_cell(txt: str) -> str:
+  tokens = (txt or "").replace("\n", " ").split()
+  if not tokens:
+    return "1"
+  if len(tokens) >= 2 and tokens[0].isdigit() and not tokens[-1].isdigit() and len(tokens[-1]) <= 3:
+    tok = tokens[-1]
+  else:
+    tok = tokens[0]
+  m = REV_RE.match(tok)
+  if m:
+    return m.group(1).upper()
+  return re.sub(r"^Rev\.?", "", tok, flags=re.IGNORECASE)[:6] or "1"
+
+
+# -------------------- Cách A: bảng có đường kẻ (chính xác nhất) --------------
+def _flat_cell(s) -> str:
+  s = (s or "").replace("\r", "")
+  s = re.sub(r"(?<=[A-Za-z0-9])-\n(?=[A-Za-z0-9])", "-", s)
+  s = re.sub(r"\s*\n\s*", " ", s)
+  return re.sub(r"\s+", " ", s).strip()
+
+
+def _code_from_cell(cell):
+  s = re.sub(r"(?<=[-_])\s*\n\s*", "", cell or "")  # mã bị xuống dòng sau dấu - hoặc _
+  s = _flat_cell(s)
+  for m in CODE_RE.finditer(s):
+    code = m.group(1)
+    if "EVNPMB2" in code or "QT1-HDH" in code:
+      continue
+    return code, s
+  return "", s
+
+
+def _header_cols(row):
+  cells = [re.sub(r"\s+", " ", (c or "")).strip().lower() for c in row]
+  idx = {}
+  for i, c in enumerate(cells):
+    if not c:
+      continue
+    if "purpose" in c and "purpose" not in idx:
+      idx["purpose"] = i
+    elif re.match(r"^rev", c) and "rev" not in idx:
+      idx["rev"] = i
+    elif ("title" in c or "description" in c) and "title" not in idx:
+      idx["title"] = i
+    elif ("document" in c or "drawing" in c or c.startswith("doc")) and "doc" not in idx:
+      idx["doc"] = i
+  if "title" in idx and ("doc" in idx or "rev" in idx):
+    idx.setdefault("doc", idx["title"])
+    return idx
+  return None
+
+
+def _infer_cols(tbl):
+  """Bảng không có dòng tiêu đề (trang nối tiếp): suy ra cột từ vị trí chứa mã tài liệu."""
+  width = max(len(r) for r in tbl)
+  counts = [0] * width
+  for row in tbl:
+    for i, c in enumerate(row):
+      if _code_from_cell(c or "")[0]:
+        counts[i] += 1
+  if not any(counts):
+    return None
+  d = counts.index(max(counts))
+  cols = {"doc": d, "title": d}
+  if d + 1 < width:
+    cols["rev"] = d + 1
+  if d + 2 < width:
+    cols["title"] = d + 2
+  return cols
+
+
+def _docs_from_tables(pages: list) -> dict:
+  raw_docs = {}
+  cols, ncols, last = None, 0, None
+  for pg in pages:
+    for tbl in pg.get("tables", []):
+      width = max(len(r) for r in tbl)
+      hdr_row = -1
+      for ri, row in enumerate(tbl[:5]):
+        found = _header_cols(row)
+        if found:
+          cols, ncols, hdr_row = found, len(row), ri
+          break
+      if hdr_row < 0 and (cols is None or width != ncols):
+        cols, ncols = _infer_cols(tbl), width
+      if cols is None:
+        continue
+
+      def cell(row, key):
+        i = cols.get(key)
+        return row[i] if i is not None and i < len(row) and row[i] else ""
+
+      for row in tbl[hdr_row + 1 :]:
+        code, doc_flat = _code_from_cell(cell(row, "doc"))
+        if not code:
+          # hàng nối tiếp: ô mã trống nhưng ô tiêu đề còn chữ -> nối vào tài liệu trước
+          extra = _flat_cell(cell(row, "title"))
+          if last and extra and not re.search(r"[A-Za-z]", doc_flat) and not _flat_cell(cell(row, "rev")):
+            raw_docs[last]["raw"] += " " + extra
+          continue
+        norm = normalize_doc_code(code)
+        if not norm:
+          continue
+        if cols["title"] == cols["doc"]:  # mã và tiêu đề chung 1 ô
+          title = re.sub(r"^\s*\d{1,3}\s+", "", doc_flat.replace(code, " "))
+        else:
+          title = _flat_cell(cell(row, "title"))
+        words = title.split()
+        if "purpose" not in cols:
+          while words and words[-1].upper() in PURPOSE_MARKERS:
+            words.pop()
+        entry = {
+            "doc_no": norm,
+            "rev": _rev_from_cell(_flat_cell(cell(row, "rev"))) if "rev" in cols else "1",
+            "raw": " ".join(words),
+        }
+        if norm not in raw_docs or not raw_docs[norm]["raw"]:
+          raw_docs[norm] = entry
+        last = norm
+  return _finalize_docs(raw_docs)
+
+
+def _finalize_docs(raw_docs: dict) -> dict:
+  docs = {}
+  for k, v in raw_docs.items():
+    docs[k] = {
+        "doc_no": v["doc_no"],
+        "rev": v["rev"],
+        "title": clean_document_title(v["raw"], strip_index=False),
+    }
+  return docs
+
+
+# -------------- Cách B: bảng không viền, đọc theo toạ độ dòng/cột --------------
+def _is_table_header(ln) -> bool:
+  toks = [w["t"].lower().strip(".:/,") for w in ln["words"]]
+  has_rev = any(t in ("rev", "revision") for t in toks)
+  has_title = any(("title" in t or "description" in t) for t in toks)
+  return has_rev and has_title
+
+
+def _is_end_line(ln) -> bool:
+  return bool(re.search(r"END\s*-|-\s*END", ln["text"])) and not CODE_RE.search(ln["text"])
+
+
+def _find_anchor(ln, purpose_cut):
+  """Tìm từ chứa mã tài liệu trong dòng và tách Rev / phần đầu tiêu đề đứng cùng dòng."""
+  for idx_w, w in enumerate(ln["words"]):
+    m = CODE_RE.search(w["t"])
+    if not m or "EVNPMB2" in m.group(1) or "QT1-HDH" in m.group(1):
+      continue
+    before = " ".join(x["t"].lower() for x in ln["words"][:idx_w])
+    if re.search(r"\b(reference|ref\.?|attn|attachment)\b", before):
+      continue  # mã nằm trong câu tham chiếu, không phải hàng của bảng
+    raw_code = m.group(1)
+    tokens = ln["words"][idx_w + 1 :]
+    if raw_code.endswith(("-", "_")) and tokens and re.match(r"^[A-Za-z0-9]+$", tokens[0]["t"]):
+      raw_code += tokens[0]["t"]  # mã bị tách làm 2 từ
+      tokens = tokens[1:]
+    if purpose_cut is not None:
+      tokens = [t for t in tokens if t["x0"] < purpose_cut]
+    while tokens and tokens[-1]["t"].upper() in PURPOSE_MARKERS:
+      tokens = tokens[:-1]
+    texts = [t["t"] for t in tokens]
+    rev, rest = _split_rev_title(texts)
+    consumed = len(texts) - len(rest)
+    return {
+        "code": raw_code,
+        "rev": rev,
+        "rest": rest,
+        "rest_x0": tokens[consumed]["x0"] if rest else None,
+        "rev_x1": tokens[consumed - 1]["x1"] if consumed else w["x1"],
+        "line": ln,
+    }
+  return None
+
+
+def _header_line_idx(lines):
+  """Chỉ số dòng cuối của phần tiêu đề bảng (No | Document | Rev | Title | Purpose)."""
+  for i, ln in enumerate(lines):
+    if _is_table_header(ln):
+      return i
+  for i, ln in enumerate(lines):  # text phẳng của pypdf: mỗi ô nằm 1 dòng riêng
+    if ln["text"].strip().lower().strip(".:") in ("rev", "revision"):
+      window = [l["text"].strip().lower().strip(".:/") for l in lines[i : i + 5]]
+      if any(("title" in w or "description" in w) for w in window):
+        last = i
+        for k, w in enumerate(window):
+          if "title" in w or "description" in w or "purpose" in w:
+            last = i + k
+        return last
+  return None
+
+
+def _docs_from_layout(lines_by_page: list, column_aware: bool = True) -> dict:
+  """Bảng không viền. Mỗi hàng = 1 dòng chứa mã tài liệu + các dòng tiêu đề nối tiếp.
+  Hỗ trợ cả bảng căn trên (tiêu đề ở dưới mã) lẫn căn giữa (tiêu đề nằm trên và dưới mã)."""
+  header_exists = any(_header_line_idx(lines) is not None for lines in lines_by_page)
+  started = not header_exists
+  purpose_cut = None
+
+  # ---- Bước 1: tìm dòng-mã (anchor) và các dòng "mồ côi" (chưa biết thuộc hàng nào)
+  pages = []
+  for lines in lines_by_page:
+    a_from, a_to = 0, len(lines)
+    if header_exists:
+      h = _header_line_idx(lines)
+      if h is not None:
+        started = True
+        for hl in lines[max(0, h - 2) : h + 3]:
+          for w in hl["words"]:
+            if column_aware and w["t"].lower().startswith("purpose"):
+              purpose_cut = w["x0"] - 15
+        a_from = h + 1
+      elif not started:
+        continue
+    for i in range(a_from, len(lines)):
+      if _is_end_line(lines[i]):
+        a_to = i
+        if header_exists:
+          started = False
+        break
+    anchors, orphans = [], []
+    for i in range(a_from, a_to):
+      ln = lines[i]
+      a = _find_anchor(ln, purpose_cut)
+      if a:
+        a["i"] = i
+        anchors.append(a)
+      elif STOP_LINE_RE.search(ln["text"]) or _is_table_header(ln):
+        continue
+      elif not column_aware and (
+          ln["text"].strip().upper() in PURPOSE_MARKERS
+          # số đứng riêng 1 dòng ngay trước dòng có mã = STT của hàng kế (còn Rev "0"/"1" thì giữ)
+          or (
+              re.fullmatch(r"\d{1,3}", ln["text"].strip())
+              and i + 1 < a_to
+              and _find_anchor(lines[i + 1], purpose_cut)
+          )
+      ):
+        continue
+      else:
+        orphans.append(i)
+    pages.append({"lines": lines, "anchors": anchors, "orphans": orphans})
+
+  all_anchors = [a for p in pages for a in p["anchors"]]
+  if not all_anchors:
+    return {}
+
+  # ---- Bước 2: xác định lề trái của cột Tiêu đề từ dữ liệu thật
+  title_left = None
+  if column_aware:
+    xs = sorted(a["rest_x0"] for a in all_anchors if a["rest_x0"] is not None)
+    if xs:
+      title_left = xs[len(xs) // 2]
+    else:
+      rx = sorted(a["rev_x1"] for a in all_anchors)
+      title_left = rx[len(rx) // 2] + 1
+
+  def eligible(ln):
+    if not column_aware:
+      return list(ln["words"])
+    return [
+        w
+        for w in ln["words"]
+        if w["x0"] >= title_left - 6 and not (purpose_cut is not None and w["x0"] >= purpose_cut)
+    ]
+
+  def limit_of(ln):
+    return max(1.6 * max(ln["bottom"] - ln["top"], 8), 14) if column_aware else float("inf")
+
+  # ---- Bước 3: bảng căn giữa? (mã nằm giữa, tiêu đề tràn lên dòng trên/dưới mã)
+  center_mode = False
+  if column_aware:
+    for p in pages:
+      for a in p["anchors"]:
+        if a["rest"]:
+          continue
+        ln = a["line"]
+        lim = limit_of(ln)
+        for oi in p["orphans"]:
+          o = p["lines"][oi]
+          if not eligible(o):
+            continue
+          # so khoảng cách TÂM dòng (hai dòng căn giữa có thể chồng nhau theo chiều dọc)
+          if abs(o["cy"] - ln["cy"]) <= lim + max(ln["bottom"] - ln["top"], 8):
+            center_mode = True
+
+  # ---- Bước 4: gán dòng mồ côi cho hàng gần nhất rồi kiểm tra tính liền mạch
+  raw_docs = {}
+  for p in pages:
+    lines, anchors = p["lines"], p["anchors"]
+    owned = {a["i"]: [] for a in anchors}
+    for oi in p["orphans"]:
+      o = lines[oi]
+      if not eligible(o):
+        continue
+      prev_a = next((a for a in reversed(anchors) if a["i"] < oi), None)
+      next_a = next((a for a in anchors if a["i"] > oi), None)
+      if center_mode:
+        cands = [a for a in (prev_a, next_a) if a]
+        owner = min(cands, key=lambda a: abs(a["line"]["cy"] - o["cy"])) if cands else None
+      else:
+        owner = prev_a
+      if owner is not None:
+        owned[owner["i"]].append(oi)
+
+    for a in anchors:
+      ln = a["line"]
+      lim = limit_of(ln)
+      below, above = [], []
+      prev_bottom = ln["bottom"]
+      for oi in sorted(x for x in owned[a["i"]] if x > a["i"]):
+        o = lines[oi]
+        if o["top"] - prev_bottom > lim:
+          break
+        below.append(oi)
+        prev_bottom = o["bottom"]
+      prev_top = ln["top"]
+      for oi in sorted((x for x in owned[a["i"]] if x < a["i"]), reverse=True):
+        o = lines[oi]
+        if prev_top - o["bottom"] > lim:
+          break
+        above.insert(0, oi)
+        prev_top = o["top"]
+
+      def line_text(oi):
+        t2 = [w["t"] for w in eligible(lines[oi])]
+        if (
+            not column_aware
+            and len(t2) >= 2
+            and t2[-1].isdigit()
+            and len(t2[-1]) <= 3
+            and t2[-2].upper() in PURPOSE_MARKERS
+        ):
+          t2 = t2[:-1]  # pypdf dính số thứ tự của hàng kế tiếp vào cuối dòng
+        while len(t2) > 1 and t2[-1].upper() in PURPOSE_MARKERS:
+          t2.pop()
+        return " ".join(t2)
+
+      rev = a["rev"]
+      below_texts = [line_text(oi) for oi in below]
+      if not column_aware and not a["rest"] and below_texts:
+        rev, rest2 = _split_rev_title(below_texts[0].split())  # pypdf đẩy Rev xuống dòng sau mã
+        below_texts[0] = " ".join(rest2)
+      parts = [line_text(oi) for oi in above] + [" ".join(a["rest"])] + below_texts
+      norm = normalize_doc_code(a["code"])
+      if norm and (norm not in raw_docs or not raw_docs[norm]["raw"]):
+        raw_docs[norm] = {"doc_no": norm, "rev": rev, "raw": " ".join(x for x in parts if x)}
+  return _finalize_docs(raw_docs)
+
+
+# ----------------------------- Hàm chính -------------------------------------
+def extract_cover_metadata_fast(pdf_bytes: bytes, filename: str = "") -> dict:
+  """Đọc Cover PDF theo toạ độ (dòng, cột, ô bảng) thay vì giải nén thô từng stream."""
+  pages = _load_pages(pdf_bytes)
+  has_words = any(p["words"] for p in pages)
+  lines_by_page = [_group_lines(p["words"]) for p in pages if p["words"]] if has_words else []
+  is_ocr = bool(pages and pages[0].get("ocr"))
+
+  if has_words:
+    full_text = "\n".join(l["text"] for ls in lines_by_page for l in ls)
+  else:
+    full_text = _pypdf_text(pdf_bytes)
 
   # 1. Tr_no
   tr_no = ""
-  m_fn = re.search(
-      r"(QT1-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+)", filename
-  )
+  m_fn = re.search(r"(QT1-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+)", filename)
   if m_fn:
     tr_no = m_fn.group(1).strip()
   if not tr_no:
@@ -222,113 +781,97 @@ def extract_cover_metadata_fast(pdf_bytes: bytes, filename: str = "") -> dict:
     tr_no = "QT1-Transmittal"
 
   # 2. Date
-  date_str = extract_cover_date_bulletproof(full_text)
+  head_lines = [l for ls in lines_by_page[:2] for l in ls]
+  date_str = _find_date_in_lines(head_lines) or extract_cover_date_bulletproof(full_text)
 
   # 3. Subject
-  subject = ""
-  m_sub = re.search(
-      r"(?:SUBJECT|Subject)\s*[:\s]+([^\n\r]+)", full_text, re.IGNORECASE
-  )
-  if m_sub:
-    raw_sub = m_sub.group(1).strip()
-    subject = re.split(
-        r"(?:Reference|Dear|Attn|Attachment|Document/Drawing|Sheet:)",
-        raw_sub,
-        flags=re.IGNORECASE,
-    )[0].strip()
+  subject = _find_subject_in_lines(head_lines)
+  if not subject:
+    m_sub = re.search(r"(?:SUBJECT|Subject)\s*[:\s]+([^\n\r]+)", full_text, re.IGNORECASE)
+    if m_sub:
+      subject = re.split(
+          r"(?:Reference|Dear|Attn|Attachment|Document/Drawing|Sheet:)",
+          m_sub.group(1).strip(),
+          flags=re.IGNORECASE,
+      )[0].strip()
   if not subject:
     subject = "Official Transmittal"
 
-  # 4. Trích xuất danh mục tài liệu
-  docs = {}
-  lines = full_text.splitlines()
-  purpose_markers = {
-      "IFA",
-      "IFI",
-      "APD",
-      "AB",
-      "RI",
-      "END",
-      "- END -",
-      "-END-",
-      "-",
-  }
-
-  i = 0
-  while i < len(lines):
-    line = lines[i].strip()
-    m_doc = re.search(r"(QT1-[0-9L]-[A-Za-z0-9_-]+)", line)
-    if (
-        m_doc
-        and "EVNPMB2" not in m_doc.group(1)
-        and "QT1-HDH" not in m_doc.group(1)
-    ):
-      raw_code = m_doc.group(1).strip()
-      norm_code = normalize_doc_code(raw_code)
-      after = line[m_doc.end() :].strip()
-
-      words = after.split()
-      while words and words[-1].upper() in purpose_markers:
-        words.pop()
-      while words and words[-1] in ["-", "END"]:
-        words.pop()
-
-      rev = "1"
-      if (
-          len(words) >= 2
-          and words[0].isdigit()
-          and (len(words[1]) <= 3 and words[1].isalnum() and not words[1].isdigit())
-      ):
-        words.pop(0)
-        rev = words.pop(0)
-      elif len(words) >= 1 and len(words[0]) <= 3 and words[0].isalnum():
-        rev = words.pop(0)
-      elif len(words) >= 1 and re.match(
-          r"^Rev\.?([A-Za-z0-9]+)$", words[0], re.IGNORECASE
-      ):
-        m_r = re.match(r"^Rev\.?([A-Za-z0-9]+)$", words[0], re.IGNORECASE)
-        rev = m_r.group(1)
-        words.pop(0)
-
-      title_parts = [" ".join(words).strip()]
-
-      j = i + 1
-      while j < len(lines):
-        next_line = lines[j].strip()
-        if (
-            re.search(r"(QT1-[0-9L]-[A-Za-z0-9_-]+)", next_line)
-            or re.match(r"^\d{1,2}\s+", next_line)
-            or "Purpose:" in next_line
-        ):
-          break
-        if next_line and not any(
-            k in next_line for k in ["Sheet:", "Date:", "Page", "END -"]
-        ):
-          clean_next = " ".join([
-              w
-              for w in next_line.split()
-              if w.upper() not in purpose_markers and not w.isdigit()
-          ])
-          if clean_next:
-            title_parts.append(clean_next)
-        j += 1
-
-      combined_title = clean_document_title(" ".join(title_parts))
-
-      if norm_code and combined_title:
-        docs[norm_code] = {
-            "doc_no": norm_code,
-            "rev": rev,
-            "title": combined_title,
-        }
-    i += 1
+  # 4. Danh mục tài liệu: bảng có viền -> bảng không viền -> text phẳng
+  docs, method = {}, "none"
+  if any(p.get("tables") for p in pages):
+    docs = _docs_from_tables(pages)
+    method = "table"
+  if not docs and lines_by_page:
+    docs = _docs_from_layout(lines_by_page, column_aware=True)
+    method = "layout"
+  if not docs:
+    docs = _docs_from_layout([_text_to_pseudo_lines(full_text)], column_aware=False)
+    method = "text"
+  if not docs:
+    method = "none"
 
   return {
       "tr_no": tr_no,
-      "date_str": date_str if date_str else datetime.now().strftime("%d/%m/%Y"),
+      "date_str": date_str if date_str else datetime.now(VN_TZ).strftime("%d/%m/%Y"),
+      "date_found": bool(date_str),
       "subject": subject,
       "docs": docs,
+      "parse_info": {"method": method, "ocr": is_ocr, "pages": len(pages)},
   }
+
+
+def _cover_from_excel(cover_bytes: bytes, filename: str, cover_data: dict) -> dict:
+  """Đọc Cover dạng .xlsx: mã tài liệu, Rev, tiêu đề, Subject, Date, số Transmittal."""
+  wb_t = openpyxl.load_workbook(io.BytesIO(cover_bytes), data_only=True)
+  ws_t = wb_t.active
+  grid = [list(r) for r in ws_t.iter_rows(values_only=True)]
+
+  def sv(v):
+    if v is None:
+      return ""
+    if isinstance(v, float) and v.is_integer():
+      v = int(v)  # Rev 0 / 1 không bị thành "0.0" hay bị `or "1"` nuốt mất
+    return str(v).strip()
+
+  m_fn = re.search(r"(QT1-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+-[A-Za-z0-9]+)", filename)
+  if m_fn:
+    cover_data["tr_no"] = m_fn.group(1)
+
+  def value_of_label(r, c, val):
+    if ":" in val and val.split(":", 1)[1].strip():
+      return val.split(":", 1)[1].strip()
+    for x in grid[r][c + 1 :]:
+      if sv(x):
+        return x
+    if r + 1 < len(grid) and c < len(grid[r + 1]) and sv(grid[r + 1][c]):
+      return grid[r + 1][c]
+    return ""
+
+  for r, row in enumerate(grid):
+    for c, raw in enumerate(row):
+      val = sv(raw)
+      if not val:
+        continue
+      low = val.lower()
+      if re.match(r"^subject\s*:?", low) and cover_data["subject"] == "Official Transmittal":
+        v = sv(value_of_label(r, c, val))
+        if v:
+          cover_data["subject"] = v
+      elif re.match(r"^date\s*:?$", low) or low.startswith("date:"):
+        v = value_of_label(r, c, val)
+        d = v.strftime("%d/%m/%Y") if isinstance(v, datetime) else _parse_date_snippet(sv(v))
+        if d and not cover_data.get("date_found"):
+          cover_data["date_str"], cover_data["date_found"] = d, True
+      m = re.match(r"^(QT1-[0-9L]-[A-Za-z0-9_-]+)$", val)
+      if m and "QT1-HDH" not in val and "EVNPMB2" not in val:
+        doc_no = normalize_doc_code(m.group(1))
+        vals = [sv(x) for x in row[c + 1 :] if sv(x)]
+        rev, rest = _split_rev_title(vals)
+        title = clean_document_title(rest[0] if rest else "", strip_index=False)
+        if doc_no and (doc_no not in cover_data["docs"] or not cover_data["docs"][doc_no]["title"]):
+          cover_data["docs"][doc_no] = {"doc_no": doc_no, "rev": rev, "title": title}
+  return cover_data
 
 
 def find_template(prefix):
@@ -499,6 +1042,9 @@ def replace_value_after_keyword(paragraph, keyword, new_text):
 
 
 def update_date_paragraph(paragraph, new_date_str):
+  if not paragraph.runs:
+    paragraph.add_run("                                " + new_date_str)
+    return
   val_font = paragraph.runs[-1].font
   val_name, val_size, val_bold, val_italic = (
       val_font.name,
@@ -560,15 +1106,18 @@ async def export_zip_full(
 
   try:
     car_metadata = json.loads(metadata) if metadata else {}
-    now = datetime.now()
+    now = datetime.now(VN_TZ)
+    warnings = []
     current_date_str = now.strftime("%d %b %Y")
     current_date_en = now.strftime("%B %d, %Y")
 
     cover_data = {
         "tr_no": "QT1-Document",
         "date_str": now.strftime("%d/%m/%Y"),
+        "date_found": False,
         "subject": "Official Transmittal",
         "docs": {},
+        "parse_info": {"method": "none", "ocr": False, "pages": 0},
     }
 
     if cover_file is not None:
@@ -577,30 +1126,29 @@ async def export_zip_full(
         cover_data = extract_cover_metadata_fast(
             cover_bytes, cover_file.filename
         )
-      elif cover_file.filename.lower().endswith((".xlsx", ".xls")):
-        wb_temp = openpyxl.load_workbook(
-            io.BytesIO(cover_bytes), data_only=True
+      elif cover_file.filename.lower().endswith((".xlsx", ".xlsm")):
+        cover_data = _cover_from_excel(
+            cover_bytes, cover_file.filename, cover_data
         )
-        ws_t = wb_temp.active
-        for r in range(1, ws_t.max_row + 1):
-          for c in range(1, ws_t.max_column + 1):
-            val = str(ws_t.cell(row=r, column=c).value or "").strip()
-            m = re.match(r"^(QT1-[0-9L]-[A-Z0-9_-]+)$", val)
-            if m and "QT1-HDH" not in val:
-              doc_no = normalize_doc_code(m.group(1))
-              rev_val = str(ws_t.cell(row=r, column=c + 1).value or "1").strip()
-              title_val = clean_document_title(
-                  str(ws_t.cell(row=r, column=c + 2).value or "").strip()
-              )
-              cover_data["docs"][doc_no] = {
-                  "doc_no": doc_no,
-                  "rev": rev_val,
-                  "title": title_val,
-              }
+        cover_data["parse_info"] = {"method": "excel", "ocr": False, "pages": 1}
+      else:
+        raise ValueError(
+            "Thư Cover chỉ hỗ trợ .pdf hoặc .xlsx (tệp .xls cũ cần lưu lại thành .xlsx)."
+        )
       del cover_bytes
 
     if custom_date and custom_date.strip():
       cover_data["date_str"] = custom_date.strip()
+    elif cover_file is not None and not cover_data.get("date_found"):
+      warnings.append(
+          "Không đọc được ngày trên Cover, đang dùng ngày hôm nay - hãy nhập tay"
+          " ở ô 'Ngày phát hành công văn'."
+      )
+    if cover_file is not None and not cover_data["docs"]:
+      warnings.append(
+          "Không đọc được danh mục tài liệu từ Cover (Cover scan ảnh hoặc bố cục"
+          " lạ) - hãy kiểm tra lại các thư Word xuất ra."
+      )
 
     vi_template_path = find_template("TV")
     en_template_path = find_template("QTI-PECC1")
@@ -994,6 +1542,7 @@ async def export_zip_full(
 
           except Exception as fe:
             print(f"Lỗi tệp {file.filename}: {fe}")
+            warnings.append(f"Không xử lý được tệp {file.filename}: {fe}")
 
       # 3. TRẢ LỜI THƯ THUẦN TÚY (KHÔNG KÈM CAR)
       elif mode == "no_car_letter":
@@ -1027,7 +1576,7 @@ async def export_zip_full(
         for row in tbl.rows:
           for cell in row.cells:
             for p in cell.paragraphs:
-              if "ngày" in p.text and "tháng" in p.text:
+              if "ngày" in p.text and "tháng" in p.text and p.runs:
                 p.runs[0].text = (
                     f"Hà Nội, ngày {now.day} tháng {now.month} năm {now.year}"
                 )
@@ -1062,8 +1611,6 @@ async def export_zip_full(
             for p in cell.paragraphs:
               if "Ref. No.:" in p.text:
                 replace_value_after_keyword(p, "Ref. No.:", cover_data["tr_no"])
-              elif "October" in p.text or "202" in p.text:
-                update_date_paragraph(p, current_date_en)
               elif "Identification Number." in p.text:
                 replace_value_after_keyword(
                     p, "Identification Number.", qti_no.strip()
@@ -1072,6 +1619,9 @@ async def export_zip_full(
                 replace_value_after_keyword(
                     p, "Subject:", cover_data["subject"]
                 )
+              # Đặt SAU CÙNG: trước đây đoạn Subject/số hiệu có chữ "202x" bị ghi đè thành ngày
+              elif "October" in p.text or "202" in p.text:
+                update_date_paragraph(p, current_date_en)
 
       sync_footer_content(doc_en, qti_no.strip(), cover_data["subject"])
 
@@ -1170,20 +1720,42 @@ async def export_zip_full(
         )
     }
     try:
-      items_json = json.dumps(
-          [{
+      items = [
+          {
               "doc_no": i["doc_no"],
               "assigned_car": i["assigned_car_name"],
               "status": i["status"],
           }
-           for i in processed_car_list],
-          ensure_ascii=False,
-      )
-      b64_str = base64.b64encode(items_json.encode("utf-8")).decode("ascii")
-      if len(b64_str) < 6000:
-        headers["X-Processed-Items"] = b64_str
-    except:
-      pass
+          for i in processed_car_list
+      ]
+      total_items = len(items)
+      # Header HTTP có giới hạn dung lượng: bớt dần phần tử cuối thay vì bỏ cả danh sách
+      while items:
+        b64_str = base64.b64encode(
+            json.dumps(items, ensure_ascii=False).encode("utf-8")
+        ).decode("ascii")
+        if len(b64_str) < 6000:
+          headers["X-Processed-Items"] = b64_str
+          break
+        items.pop()
+      info = {
+          "tr_no": cover_data["tr_no"],
+          "date": cover_data["date_str"],
+          "subject": cover_data["subject"],
+          "doc_count": len(cover_data["docs"]),
+          "method": cover_data.get("parse_info", {}).get("method", ""),
+          "ocr": cover_data.get("parse_info", {}).get("ocr", False),
+          "processed_total": total_items,
+          "processed_shown": len(items),
+          "warnings": warnings[:10],
+      }
+      info_b64 = base64.b64encode(
+          json.dumps(info, ensure_ascii=False).encode("utf-8")
+      ).decode("ascii")
+      if len(info_b64) < 6000:
+        headers["X-Cover-Info"] = info_b64
+    except Exception as he:
+      print("Không tạo được header kết quả:", he)
 
     return FileResponse(
         path=temp_zip_path,
